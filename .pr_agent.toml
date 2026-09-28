@@ -1,0 +1,44 @@
+# PR-Agent Central Global Configuration for all repositories under @JWEB0689
+# Loaded automatically by PR-Agent via GitHub Provider global settings mechanism:
+# github.com/JWEB0689/pr-agent-settings/.pr_agent.toml
+
+[config]
+model = "gemini/gemini-2.5-flash"
+fallback_models = ["gemini/gemini-3.5-flash-lite"]
+git_provider = "github"
+
+[pr_reviewer]
+require_score_review = false
+require_tests_review = true
+require_security_review = true
+require_estimate_effort_to_review = true
+persistent_comment = true
+enable_review_labels_security = true
+enable_review_labels_effort = true
+
+[pr_code_suggestions]
+commitable_code_suggestions = true
+focus_only_on_problems = true
+num_code_suggestions_per_chunk = 4
+
+[github_app]
+pr_commands = [
+    "/describe",
+    "/review",
+    "/improve",
+]
+handle_push_trigger = true
+push_commands = [
+    "/review",
+    "/improve",
+]
+
+[github_action_config]
+auto_review = true
+auto_describe = true
+auto_improve = true
+handle_push_trigger = true
+push_commands = [
+    "/review",
+    "/improve",
+]

@@ -1,0 +1,39 @@
+name: PR-Agent Reusable Workflow
+
+on:
+  workflow_call:
+    inputs:
+      model:
+        type: string
+        default: "gemini/gemini-2.5-flash"
+        description: "Model to use for PR-Agent"
+    secrets:
+      GEMINI_API_KEY:
+        required: true
+
+jobs:
+  pr_agent_job:
+    if: ${{ github.event.sender.type != 'Bot' && (github.event_name == 'pull_request' || github.event.issue.pull_request) }}
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+      contents: write
+      checks: write
+    steps:
+      - name: PR Agent action step
+        id: pragent
+        uses: the-pr-agent/pr-agent@main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GOOGLE_AI_STUDIO.GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          config.model: ${{ inputs.model }}
+          config.fallback_models: '["gemini/gemini-3.5-flash-lite"]'
+          github_action_config.auto_review: "true"
+          github_action_config.auto_describe: "true"
+          github_action_config.auto_improve: "true"
+          github_action_config.handle_push_trigger: "true"
+          github_action_config.push_commands: '["/review", "/improve"]'
+          pr_code_suggestions.commitable_code_suggestions: "true"
+          pr_reviewer.require_security_review: "true"
+          pr_reviewer.require_tests_review: "true"
