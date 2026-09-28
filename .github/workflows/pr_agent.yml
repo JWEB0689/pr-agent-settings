@@ -5,7 +5,7 @@ on:
     inputs:
       model:
         type: string
-        default: "gemini/gemini-2.5-flash"
+        default: "gemini/gemini-3.8-flash"
         description: "Model to use for PR-Agent"
     secrets:
       GEMINI_API_KEY:
@@ -28,7 +28,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GOOGLE_AI_STUDIO.GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           config.model: ${{ inputs.model }}
-          config.fallback_models: '["gemini/gemini-3.5-flash-lite"]'
+          config.fallback_models: '["gemini/gemini-3.8-flash"]'
           github_action_config.auto_review: "true"
           github_action_config.auto_describe: "true"
           github_action_config.auto_improve: "true"

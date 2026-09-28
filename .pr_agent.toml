@@ -3,8 +3,8 @@
 # github.com/JWEB0689/pr-agent-settings/.pr_agent.toml
 
 [config]
-model = "gemini/gemini-2.5-flash"
-fallback_models = ["gemini/gemini-3.5-flash-lite"]
+model = "gemini/gemini-3.8-flash"
+fallback_models = ["gemini/gemini-3.8-flash"]
 git_provider = "github"
 
 [pr_reviewer]
