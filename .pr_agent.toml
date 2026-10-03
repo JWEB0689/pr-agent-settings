@@ -6,6 +6,7 @@
 model = "gemini/gemini-3.8-flash"
 fallback_models = ["gemini/gemini-3.8-flash"]
 git_provider = "github"
+repo_context_files = ["AGENTS.md", "CLAUDE.md"]
 
 [pr_reviewer]
 require_score_review = false
@@ -15,6 +16,13 @@ require_estimate_effort_to_review = true
 persistent_comment = true
 enable_review_labels_security = true
 enable_review_labels_effort = true
+publish_output_no_suggestions = true
+
+[pr_description]
+enable_pr_type = true
+enable_pr_description = true
+enable_pr_diagram = true
+collapsible_file_list = "adaptive"
 
 [pr_code_suggestions]
 commitable_code_suggestions = true
