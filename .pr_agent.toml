@@ -4,7 +4,7 @@
 
 [config]
 model = "gemini/gemini-3.8-flash"
-fallback_models = ["gemini/gemini-3.8-flash"]
+fallback_models = ["gemini/gemini-2.5-flash", "gemini/gemini-2.5-flash-lite"]
 git_provider = "github"
 repo_context_files = ["AGENTS.md", "CLAUDE.md"]
 
