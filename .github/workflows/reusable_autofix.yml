@@ -1,0 +1,115 @@
+name: Autonomous CI Auto-Fixer
+
+on:
+  workflow_call:
+    inputs:
+      model:
+        type: string
+        default: "gemini-2.5-flash"
+        description: "Gemini model to use"
+      pr_number:
+        type: string
+        required: false
+        description: "Pull request number"
+      head_ref:
+        type: string
+        required: false
+        description: "PR head branch ref"
+      base_ref:
+        type: string
+        default: "origin/main"
+        description: "Base branch ref"
+    secrets:
+      GEMINI_API_KEY:
+        required: true
+
+  issue_comment:
+    types: [created]
+
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to repair"
+        required: true
+        type: string
+      model:
+        description: "Gemini Model"
+        required: false
+        default: "gemini-2.5-flash"
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  autofix:
+    if: |
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request && contains(github.event.comment.body, '/autofix')) ||
+      github.event_name == 'workflow_call' ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve PR Metadata
+        id: meta
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "issue_comment" ]; then
+            PR_NUM="${{ github.event.issue.number }}"
+          elif [ -n "${{ inputs.pr_number }}" ]; then
+            PR_NUM="${{ inputs.pr_number }}"
+          else
+            echo "No PR number detected."
+            exit 1
+          fi
+
+          echo "Resolving metadata for PR #$PR_NUM..."
+          PR_JSON=$(gh pr view "$PR_NUM" --repo "${{ github.repository }}" --json headRefName,baseRefName,headRepositoryOwner)
+          HEAD_REF=$(echo "$PR_JSON" | jq -r .headRefName)
+          BASE_REF="origin/$(echo "$PR_JSON" | jq -r .baseRefName)"
+          HEAD_OWNER=$(echo "$PR_JSON" | jq -r .headRepositoryOwner.login)
+
+          echo "pr_number=$PR_NUM" >> "$GITHUB_OUTPUT"
+          echo "head_ref=$HEAD_REF" >> "$GITHUB_OUTPUT"
+          echo "base_ref=$BASE_REF" >> "$GITHUB_OUTPUT"
+          echo "head_owner=$HEAD_OWNER" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout PR Branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.meta.outputs.head_ref }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node & Rust Toolchains
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+        continue-on-error: true
+
+      - name: Setup Rust Toolchain (if Cargo.toml exists)
+        if: hashFiles('**/Cargo.toml') != ''
+        uses: dtolnay/rust-toolchain@stable
+        continue-on-error: true
+
+      - name: Setup Python Toolchain (if pyproject/requirements exist)
+        if: hashFiles('**/pyproject.toml', '**/requirements.txt') != ''
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+        continue-on-error: true
+
+      - name: Execute Autonomous Repair
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ inputs.model || 'gemini-2.5-flash' }}
+          PR_NUMBER: ${{ steps.meta.outputs.pr_number }}
+          HEAD_REF: ${{ steps.meta.outputs.head_ref }}
+          BASE_REF: ${{ steps.meta.outputs.base_ref }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/JWEB0689/pr-agent-settings/main/scripts/autofix.py -o /tmp/autofix.py
+          chmod +x /tmp/autofix.py
+          python3 /tmp/autofix.py
