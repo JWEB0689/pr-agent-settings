@@ -58,8 +58,12 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "issue_comment" ]; then
             PR_NUM="${{ github.event.issue.number }}"
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            PR_NUM="${{ github.event.pull_request.number }}"
           elif [ -n "${{ inputs.pr_number }}" ]; then
             PR_NUM="${{ inputs.pr_number }}"
+          elif [ -n "${{ github.event.inputs.pr_number }}" ]; then
+            PR_NUM="${{ github.event.inputs.pr_number }}"
           else
             echo "No PR number detected."
             exit 1
