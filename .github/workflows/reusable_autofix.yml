@@ -1,11 +1,17 @@
 name: Autonomous CI Auto-Fixer
 
+# Shared repair engine. Entry point is the per-repo `autofix.yml`
+# (manual "/autofix" comment, auto-trigger after PR-Agent review, or dispatch).
+# The issue_comment trigger was intentionally removed: autofix.yml already
+# handles "/autofix" comments and calls this workflow, so a trigger here
+# would run the repair twice concurrently.
+
 on:
   workflow_call:
     inputs:
       model:
         type: string
-        default: "gemini-2.5-flash"
+        default: "gemini-3.8-flash"
         description: "Gemini model to use"
       pr_number:
         type: string
@@ -23,9 +29,6 @@ on:
       GEMINI_API_KEY:
         required: true
 
-  issue_comment:
-    types: [created]
-
   workflow_dispatch:
     inputs:
       pr_number:
@@ -35,7 +38,7 @@ on:
       model:
         description: "Gemini Model"
         required: false
-        default: "gemini-2.5-flash"
+        default: "gemini-3.8-flash"
         type: string
 
 permissions:
@@ -45,10 +48,6 @@ permissions:
 
 jobs:
   autofix:
-    if: |
-      (github.event_name == 'issue_comment' && github.event.issue.pull_request && contains(github.event.comment.body, '/autofix')) ||
-      github.event_name == 'workflow_call' ||
-      github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - name: Resolve PR Metadata
@@ -57,16 +56,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "issue_comment" ]; then
-            PR_NUM="${{ github.event.issue.number }}"
-          elif [ "${{ github.event_name }}" = "pull_request" ]; then
-            PR_NUM="${{ github.event.pull_request.number }}"
-          elif [ -n "${{ inputs.pr_number }}" ]; then
+          if [ -n "${{ inputs.pr_number }}" ]; then
             PR_NUM="${{ inputs.pr_number }}"
           elif [ -n "${{ github.event.inputs.pr_number }}" ]; then
             PR_NUM="${{ github.event.inputs.pr_number }}"
           else
-            echo "::error::No PR number detected — dispatch with pr_number or comment /autofix on a PR."
+            echo "::error::No PR number detected — dispatch with pr_number."
             exit 1
           fi
 
@@ -115,7 +110,8 @@ jobs:
       - name: Execute Autonomous Repair
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: ${{ inputs.model || 'gemini-2.5-flash' }}
+          GEMINI_MODEL: ${{ inputs.model || 'gemini-3.8-flash' }}
+          REPO: ${{ github.repository }}
           PR_NUMBER: ${{ steps.meta.outputs.pr_number }}
           HEAD_REF: ${{ steps.meta.outputs.head_ref }}
           BASE_REF: ${{ steps.meta.outputs.base_ref }}
