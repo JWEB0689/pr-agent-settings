@@ -1,7 +1,10 @@
 name: Autonomous CI Auto-Fixer
 
-# Shared repair engine. Entry point is the per-repo `autofix.yml`
-# (manual "/autofix" comment, auto-trigger after PR-Agent review, or dispatch).
+# Shared repair engine with three modes (see scripts/autofix.py):
+#   pr        — fix review-bot findings / CI failures on a PR branch
+#               (entry: per-repo autofix.yml via /autofix, auto-trigger, dispatch)
+#   scheduled — a scheduled workflow failed on the default branch: open a
+#               PR with the fix (entry: per-repo scheduled-autofix.yml)
 # The issue_comment trigger was intentionally removed: autofix.yml already
 # handles "/autofix" comments and calls this workflow, so a trigger here
 # would run the repair twice concurrently.
@@ -9,6 +12,10 @@ name: Autonomous CI Auto-Fixer
 on:
   workflow_call:
     inputs:
+      mode:
+        type: string
+        default: "pr"
+        description: "pr | scheduled"
       model:
         type: string
         default: "gemini-3.8-flash"
@@ -16,15 +23,31 @@ on:
       pr_number:
         type: string
         required: false
-        description: "Pull request number"
+        description: "Pull request number (pr mode)"
       head_ref:
         type: string
         required: false
-        description: "PR head branch ref"
+        description: "PR head branch ref (pr mode)"
       base_ref:
         type: string
         default: "origin/main"
-        description: "Base branch ref"
+        description: "Base branch ref (pr mode)"
+      run_id:
+        type: string
+        required: false
+        description: "Failed workflow run id (scheduled mode)"
+      workflow_name:
+        type: string
+        required: false
+        description: "Failed workflow name (scheduled mode)"
+      head_sha:
+        type: string
+        required: false
+        description: "Commit the failed run tested (scheduled mode)"
+      run_url:
+        type: string
+        required: false
+        description: "URL of the failed run (scheduled mode)"
     secrets:
       GEMINI_API_KEY:
         required: true
@@ -50,12 +73,25 @@ jobs:
   autofix:
     runs-on: ubuntu-latest
     steps:
-      - name: Resolve PR Metadata
+      - name: Resolve Metadata
         id: meta
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          if [ "${{ inputs.mode }}" = "scheduled" ]; then
+            [ -n "${{ inputs.run_id }}" ] || { echo "::error::scheduled mode needs run_id."; exit 1; }
+            DEFAULT_BRANCH=$(gh api "repos/${{ github.repository }}" --jq .default_branch)
+            SLUG=$(echo "${{ inputs.workflow_name }}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]\+/-/g' | cut -c1-30 | sed 's/-$//')
+            RID="${{ inputs.run_id }}"
+            BRANCH="autofix/sched-${SLUG}-${RID: -6}"
+            echo "mode=scheduled" >> "$GITHUB_OUTPUT"
+            echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+            echo "base_ref=$DEFAULT_BRANCH" >> "$GITHUB_OUTPUT"
+            echo "Resolved scheduled fix: branch=$BRANCH base=$DEFAULT_BRANCH"
+            exit 0
+          fi
+
           if [ -n "${{ inputs.pr_number }}" ]; then
             PR_NUM="${{ inputs.pr_number }}"
           elif [ -n "${{ github.event.inputs.pr_number }}" ]; then
@@ -77,17 +113,31 @@ jobs:
           BASE_REF="origin/$(echo "$PR_JSON" | jq -r .baseRefName)"
           HEAD_OWNER=$(echo "$PR_JSON" | jq -r .headRepositoryOwner.login)
 
+          echo "mode=pr" >> "$GITHUB_OUTPUT"
           echo "pr_number=$PR_NUM" >> "$GITHUB_OUTPUT"
           echo "head_ref=$HEAD_REF" >> "$GITHUB_OUTPUT"
           echo "base_ref=$BASE_REF" >> "$GITHUB_OUTPUT"
           echo "head_owner=$HEAD_OWNER" >> "$GITHUB_OUTPUT"
 
       - name: Checkout PR Branch
+        if: steps.meta.outputs.mode != 'scheduled'
         uses: actions/checkout@v4
         with:
           ref: ${{ steps.meta.outputs.head_ref }}
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout base commit
+        if: steps.meta.outputs.mode == 'scheduled'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.head_sha }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create fix branch
+        if: steps.meta.outputs.mode == 'scheduled'
+        run: git checkout -b "${{ steps.meta.outputs.branch }}"
 
       - name: Setup Node & Rust Toolchains
         uses: actions/setup-node@v4
@@ -111,10 +161,15 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ inputs.model || 'gemini-3.8-flash' }}
+          MODE: ${{ inputs.mode }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ steps.meta.outputs.pr_number }}
           HEAD_REF: ${{ steps.meta.outputs.head_ref }}
           BASE_REF: ${{ steps.meta.outputs.base_ref }}
+          RUN_ID: ${{ inputs.run_id }}
+          WORKFLOW_NAME: ${{ inputs.workflow_name }}
+          RUN_URL: ${{ inputs.run_url }}
+          BRANCH: ${{ steps.meta.outputs.branch }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           curl -fsSL https://raw.githubusercontent.com/JWEB0689/pr-agent-settings/main/scripts/autofix.py -o /tmp/autofix.py
