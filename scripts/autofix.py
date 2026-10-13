@@ -139,7 +139,8 @@ def gh_api_get(path):
         return None
     items, page = [], 1
     while True:
-        url = f"https://api.github.com{path}?per_page=100&page={page}"
+        sep = "&" if "?" in path else "?"
+        url = f"https://api.github.com{path}{sep}per_page=100&page={page}"
         req = urllib.request.Request(url, headers={
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
@@ -448,6 +449,222 @@ def ci_fix_mode(api_key, model, pr_number, head_ref, base_ref):
 
 # ---------------------------------------------------------------- main
 
+# ------------------------------------------------------- scheduled-fix mode
+# Mode 3: a scheduled workflow failed on the default branch. Collect the
+# failure context (failed jobs, annotations, log tails), ask Gemini for a
+# fix, and open a PR with it. Never pushes to the branch directly.
+
+SCHEDULED_SYSTEM_PROMPT = """You are an autonomous senior software engineer. A scheduled CI workflow failed on the repository's default branch. The failure context is below.
+
+1. Diagnose the exact root cause of the failure.
+2. Provide the complete updated content for each file that needs to be fixed. Do not use placeholders or omit lines.
+3. Keep changes minimal, surgical, and idiomatic. For dependency vulnerabilities, update the affected dependency constraints or manifests to fixed versions.
+4. Do NOT modify CI workflow files unless the failure is clearly caused by the workflow definition itself.
+
+Respond ONLY with a JSON object conforming strictly to this schema:
+{
+  "summary": "Short explanation of root cause and fix applied",
+  "files": [
+    {"path": "relative/path/to/file", "content": "Full, complete updated file contents"}
+  ]
+}
+If the failure is infrastructure (no runners available, disk full, rate limits, network blips) or nothing actionable in code, return {"summary": "no code fix applicable", "files": []}.
+"""
+
+INFRA_SKIP_PATTERNS = [
+    r"required runner .* not found",
+    r"No space left on device",
+    r"rate limit exceeded",
+    r"API rate limit",
+    r"The runner has received a shutdown signal",
+    r"Lost communication with the server",
+    r"Unable to connect to the server",
+    r"403.*downloading artifact",
+]
+
+
+def is_infra_failure(text):
+    return any(re.search(p, text, re.I) for p in INFRA_SKIP_PATTERNS)
+
+
+def download_job_log_tail(repo, job_id, max_lines=150):
+    """Fetch a job's log via the redirect URL; return the last N lines."""
+    token = os.environ.get("GH_TOKEN")
+    if not token:
+        return ""
+    url = f"https://api.github.com/repos/{repo}/actions/jobs/{job_id}/logs"
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    req = urllib.request.Request(url, headers={
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "autofix-bot",
+    })
+    try:
+        urllib.request.build_opener(NoRedirect).open(req, timeout=30)
+        return ""
+    except urllib.error.HTTPError as e:
+        loc = e.headers.get("Location")
+        if not loc:
+            return ""
+    except Exception as e:
+        print(f"log redirect failed: {e}", file=sys.stderr)
+        return ""
+    try:
+        # Signed blob URL: no auth needed, and must NOT carry our token.
+        with urllib.request.urlopen(loc, timeout=60) as r:
+            text = r.read().decode("utf-8", errors="ignore")
+    except Exception as e:
+        print(f"log download failed: {e}", file=sys.stderr)
+        return ""
+    return "\n".join(text.splitlines()[-max_lines:])
+
+
+def scheduled_pr_exists(repo, workflow_name):
+    """True if an open autofix PR for this scheduled workflow already exists."""
+    prs = gh_api_get(f"/repos/{repo}/pulls?state=open") or []
+    prefix = f"autofix: repair scheduled '{workflow_name}'"
+    return any((p.get("title") or "").startswith(prefix) for p in prs)
+
+
+def open_fix_pr(repo, branch, base, title, body):
+    """Open a PR via the REST API. Returns the PR URL or None."""
+    token = os.environ.get("GH_TOKEN")
+    if not token:
+        print("GH_TOKEN not set; cannot open PR.", file=sys.stderr)
+        return None
+    url = f"https://api.github.com/repos/{repo}/pulls"
+    req = urllib.request.Request(
+        url, data=json.dumps({"title": title, "head": branch,
+                              "base": base, "body": body}).encode("utf-8"),
+        headers={"Accept": "application/vnd.github+json",
+                 "X-GitHub-Api-Version": "2022-11-28",
+                 "Authorization": f"Bearer {token}",
+                 "User-Agent": "autofix-bot",
+                 "Content-Type": "application/json"},
+        method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read().decode("utf-8")).get("html_url")
+    except urllib.error.HTTPError as e:
+        print(f"open PR failed: {e.code} {e.read().decode('utf-8', errors='ignore')[:300]}",
+              file=sys.stderr)
+        return None
+
+
+def scheduled_fix_mode(api_key, model, repo, run_id, workflow_name, run_url,
+                       branch, base_ref):
+    print(f"==> Scheduled-fix mode: '{workflow_name}' run {run_id} in {repo}")
+
+    jobs_data = gh_api_get(f"/repos/{repo}/actions/runs/{run_id}/jobs") or {}
+    jobs = jobs_data.get("jobs", []) if isinstance(jobs_data, dict) else []
+    failed_jobs = [j for j in jobs if j.get("conclusion") == "failure"][:3]
+    if not failed_jobs:
+        print("No failed jobs found; nothing to fix.")
+        return True
+
+    context_parts, candidate_files = [], set()
+    for job in failed_jobs:
+        jname = job.get("name", "?")
+        steps = [s["name"] for s in job.get("steps", [])
+                 if s.get("conclusion") == "failure"]
+        context_parts.append(f"JOB: {jname}\nFAILED STEPS: {', '.join(steps) or 'job-level failure'}")
+        crid = job.get("check_run_id") or job.get("id")
+        for a in (gh_api_get(f"/repos/{repo}/check-runs/{crid}/annotations") or [])[:6]:
+            msg = (a.get("message") or "").strip()
+            if msg:
+                context_parts.append(f"ANNOTATION [{jname}]: {msg[:500]}")
+        tail = download_job_log_tail(repo, job["id"])
+        if tail:
+            context_parts.append(f"LOG TAIL [{jname}]:\n{tail}")
+    for f in extract_relevant_files_from_error("\n".join(context_parts)):
+        candidate_files.add(f)
+
+    error_text = "\n".join(context_parts)
+    if is_infra_failure(error_text):
+        print("==> Infra-level failure (runners/disk/rate limits); no code fix — skipping.")
+        return True
+
+    # Dependency-scan failures are fixed in manifests.
+    if re.search(r"osv|npm audit|dependabot|vulnerabilit|CVE", error_text, re.I):
+        for mf in ("package.json", "package-lock.json", "Cargo.toml", "Cargo.lock",
+                   "pyproject.toml", "requirements.txt", "go.mod", "go.sum",
+                   "Gemfile", "Gemfile.lock"):
+            if os.path.isfile(mf):
+                candidate_files.add(mf)
+
+    if scheduled_pr_exists(repo, workflow_name):
+        print(f"==> An open autofix PR for '{workflow_name}' already exists; skipping.")
+        return True
+
+    contexts = read_file_context(sorted(candidate_files))
+    if not contexts:
+        print("No candidate files with context; nothing to fix.")
+        return True
+
+    prompt = (SCHEDULED_SYSTEM_PROMPT
+              + f"\nWORKFLOW: {workflow_name}\nRUN: {run_url}\n"
+              + f"\n--- FAILURE CONTEXT ---\n{error_text[:12000]}\n--- END CONTEXT ---\n"
+              + f"\n--- FILE CONTENTS ---\n{json.dumps(contexts, indent=2)}\n--- END FILES ---\n")
+    print(f"==> Querying Gemini for scheduled-failure fix ({len(contexts)} files)...")
+    result = call_gemini(api_key, model, prompt)
+    summary, repaired = apply_repair_files(result, set(contexts) | candidate_files)
+    if not repaired:
+        print("Gemini returned no applicable fixes.")
+        return True
+
+    print(f"==> Applying scheduled fix: {summary}")
+    test_cwd, test_cmd = detect_test_runner(list(candidate_files))
+    if test_cmd:
+        print(f"==> Verifying with '{test_cmd}' in '{test_cwd}'")
+        v_code, v_out, v_err = run_cmd(test_cmd, cwd=test_cwd)
+        if v_code != 0:
+            print("Verification failed after applying fix. Rolling back; no PR opened.")
+            run_cmd("git checkout -- .")
+            return False
+        verify_note = f"`{test_cmd}` passed locally"
+    else:
+        verify_note = "no local test command found; CI on the PR will verify"
+
+    run_cmd(["git", "config", "user.name", "github-actions[bot]"])
+    run_cmd(["git", "config", "user.email",
+             "41898282+github-actions[bot]@users.noreply.github.com"])
+    run_cmd(["git", "add"] + repaired)
+    c_code, _, _ = run_cmd(["git", "commit", "-m",
+                            f"fix(autofix): {summary}\n\nRepair scheduled '{workflow_name}' failure (run {run_id})."])
+    if c_code != 0:
+        print("Nothing to commit.")
+        return True
+    _, sha, _ = run_cmd(["git", "rev-parse", "--short", "HEAD"])
+    sha = sha.strip()
+
+    print(f"==> Pushing branch {branch}...")
+    p_code, _, p_err = run_cmd(["git", "push", "origin", f"HEAD:{branch}"])
+    if p_code != 0:
+        print(f"Push failed: {p_err}", file=sys.stderr)
+        return False
+
+    files_md = "\n".join(f"- `{f}`" for f in repaired)
+    pr_body = (
+        f"Autonomous fix for the scheduled `{workflow_name}` failure.\n\n"
+        f"**Summary:** {summary}\n\n"
+        f"**Failed run:** {run_url}\n\n"
+        f"**Files changed:**\n{files_md}\n\n"
+        f"**Verification:** {verify_note}\n\n"
+        f"---\nAuto-generated by the autofix bot. Please review before merging.")
+    pr_url = open_fix_pr(repo, branch, base_ref,
+                         f"autofix: repair scheduled '{workflow_name}' failure",
+                         pr_body)
+    if pr_url:
+        print(f"==> Opened fix PR: {pr_url}")
+        return True
+    print("PR creation failed.", file=sys.stderr)
+    return False
+
+
 def main():
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
@@ -456,6 +673,17 @@ def main():
 
     model = os.environ.get("GEMINI_MODEL", DEFAULT_MODEL)
     repo = os.environ.get("REPO")
+    mode = os.environ.get("MODE", "pr")
+
+    if mode == "scheduled":
+        # Scheduled workflow failed on the default branch -> open a fix PR.
+        ok = scheduled_fix_mode(
+            api_key, model, repo,
+            os.environ.get("RUN_ID"), os.environ.get("WORKFLOW_NAME"),
+            os.environ.get("RUN_URL"), os.environ.get("BRANCH"),
+            os.environ.get("BASE_REF", "main"))
+        sys.exit(0 if ok else 1)
+
     pr_number = os.environ.get("PR_NUMBER")
     head_ref = os.environ.get("HEAD_REF")
     base_ref = os.environ.get("BASE_REF", "origin/main")
