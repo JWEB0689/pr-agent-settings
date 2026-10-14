@@ -210,6 +210,8 @@ def get_review_findings(repo, pr_number):
         findings.append({
             "path": c.get("path"),
             "line": c.get("line") or c.get("original_line"),
+            "start_line": (c.get("original_start_line") or c.get("start_line")
+                           or c.get("original_line") or c.get("line")),
             "author": (c.get("user") or {}).get("login"),
             "body": body[:2000],
         })
@@ -224,10 +226,101 @@ def get_review_findings(repo, pr_number):
         if author in ("github-actions[bot]",) and len(body) > 200:
             summaries.append(body[:3000])
     for s in summaries[-2:]:
-        findings.append({"path": None, "line": None,
+        findings.append({"path": None, "line": None, "start_line": None,
                          "author": "review-summary", "body": s})
 
     return findings
+
+
+SUGGESTION_RE = re.compile(r"```suggestion[^\n]*\n(.*?)\n```", re.DOTALL)
+
+
+def extract_suggestions(findings):
+    """Pull ```suggestion blocks out of review comments.
+
+    Returns [{path, start, end, code, author}]; line numbers are 1-based
+    positions in the reviewed file, matching GitHub's "commit suggestion"
+    semantics (the block replaces those lines).
+    """
+    out = []
+    for f in findings:
+        path = f.get("path")
+        if not path:
+            continue
+        try:
+            start = int(f.get("start_line") or 0)
+            end = int(f.get("line") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not start or not end or start > end:
+            continue
+        for m in SUGGESTION_RE.finditer(f.get("body") or ""):
+            out.append({"path": path, "start": start, "end": end,
+                        "code": m.group(1), "author": f.get("author")})
+    return out
+
+
+def apply_suggestions(suggestions):
+    """Apply suggestion blocks to files, bottom-up per file.
+
+    Returns the number applied, or None if any suggestion is invalid
+    (caller should roll back / fall back to the LLM path).
+    """
+    by_file = {}
+    for s in suggestions:
+        by_file.setdefault(s["path"], []).append(s)
+    total = 0
+    for path, ss in by_file.items():
+        norm = safe_normpath(path)
+        if norm is None or not os.path.isfile(norm):
+            print(f"suggestion target not a file: {path}")
+            return None
+        with open(norm, "r", encoding="utf-8", errors="ignore") as fh:
+            text = fh.read()
+        trailing_nl = text.endswith("\n")
+        lines = text.split("\n")
+        if trailing_nl and lines and lines[-1] == "":
+            lines = lines[:-1]
+        for s in sorted(ss, key=lambda x: x["start"], reverse=True):
+            st, en = s["start"], s["end"]
+            if not (1 <= st <= en <= len(lines)):
+                print(f"suggestion range out of bounds: {path}:{st}-{en} "
+                      f"(file has {len(lines)} lines)")
+                return None
+            lines[st - 1:en] = s["code"].split("\n")
+        with open(norm, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + ("\n" if trailing_nl else ""))
+        print(f"  Applied {len(ss)} suggestion(s) to {norm}")
+        total += len(ss)
+    return total
+
+
+def get_pr_ci_failures(repo, pr_number):
+    """Failing check runs on the PR head commit (excluding bot workflows)."""
+    if not repo or not pr_number:
+        return []
+    code, sha, _ = run_cmd(["git", "rev-parse", "HEAD"])
+    if code != 0:
+        return []
+    data = gh_api_get(f"/repos/{repo}/commits/{sha.strip()}/check-runs") or {}
+    runs = data.get("check_runs", []) if isinstance(data, dict) else []
+    failures = []
+    for cr in runs:
+        if cr.get("status") != "completed":
+            continue
+        if cr.get("conclusion") not in ("failure", "timed_out"):
+            continue
+        name = cr.get("name", "")
+        lname = name.lower()
+        if "auto-fixer" in lname or "autofix" in lname or "pr agent" in lname:
+            continue  # our own bot's checks; handled by their own triggers
+        failures.append({
+            "check": name,
+            "conclusion": cr.get("conclusion"),
+            "summary": ((cr.get("output") or {}).get("summary") or "")[:1500],
+            "details_url": cr.get("details_url"),
+        })
+    return failures
 
 
 REVIEW_SYSTEM_PROMPT = """You are an autonomous senior software engineer fixing code review findings.
@@ -355,6 +448,32 @@ def review_fix_mode(api_key, model, repo, pr_number, head_ref, base_ref):
     allowed = flagged | modified
     print(f"==> Flagged files: {sorted(flagged)[:10]}")
 
+    # Step 1: apply ```suggestion blocks deterministically (exact + free).
+    suggestions = extract_suggestions(findings)
+    if suggestions:
+        print(f"==> Found {len(suggestions)} suggestion block(s); applying directly.")
+        n = apply_suggestions(suggestions)
+        if n:
+            test_cwd, test_cmd = detect_test_runner(
+                list({s["path"] for s in suggestions}))
+            ok = verify_commit_push(
+                f"Apply {n} code-review suggestion(s)",
+                sorted({s["path"] for s in suggestions}),
+                test_cwd, test_cmd, pr_number, head_ref,
+                "review-suggestion repair")
+            if ok:
+                return True
+            print("Suggestion apply failed verification; rolled back, "
+                  "falling through to LLM repair.")
+        else:
+            print("Suggestion blocks not appliable; falling through to LLM repair.")
+            run_cmd("git checkout -- .")
+
+    # Step 2: LLM repair over review findings + CI failures on this PR.
+    ci_failures = get_pr_ci_failures(repo, pr_number)
+    if ci_failures:
+        print(f"==> Found {len(ci_failures)} failing CI check(s) on this PR.")
+
     contexts = read_file_context(sorted(flagged | set(list(modified)[:8])))
     if not contexts:
         print("No file context available; skipping review-fix.")
@@ -364,9 +483,13 @@ def review_fix_mode(api_key, model, repo, pr_number, head_ref, base_ref):
         [{"path": f["path"], "line": f["line"], "body": f["body"]}
          for f in findings], indent=2)[:8000]
     prompt = (REVIEW_SYSTEM_PROMPT
-              + f"\n--- REVIEW FINDINGS (PR #{pr_number}) ---\n{findings_text}\n--- END FINDINGS ---\n"
-              + f"\n--- FILE CONTENTS ---\n{json.dumps(contexts, indent=2)}\n--- END FILES ---\n"
-              + "\nOnly modify files listed in the findings or already changed in this PR.\n")
+              + f"\n--- REVIEW FINDINGS (PR #{pr_number}) ---\n{findings_text}\n--- END FINDINGS ---\n")
+    if ci_failures:
+        ci_text = json.dumps(ci_failures, indent=2)[:6000]
+        prompt += (f"\n--- CI FAILURES ON THIS PR ---\n{ci_text}\n--- END CI FAILURES ---\n"
+                   + "\nAlso fix the CI failures above with the same minimal, surgical approach.\n")
+    prompt += (f"\n--- FILE CONTENTS ---\n{json.dumps(contexts, indent=2)}\n--- END FILES ---\n"
+               + "\nOnly modify files listed in the findings or already changed in this PR.\n")
 
     print("==> Querying Gemini for review fixes...")
     result = call_gemini(api_key, model, prompt)
