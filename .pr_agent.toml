@@ -4,43 +4,71 @@
 
 [config]
 model = "gemini/gemini-3.8-flash"
-fallback_models = ["gemini/gemini-2.5-flash", "gemini/gemini-2.5-flash-lite"]
+fallback_models = [
+    "gemini/gemini-3.5-flash",
+    "gemini/gemini-2.5-flash",
+    "gemini/gemini-3.5-flash-lite",
+    "gemini/gemini-3.1-flash",
+]
 git_provider = "github"
+ai_timeout = 90
+retry_same_model_on_timeout = false
+max_model_tokens = 128000
 repo_context_files = ["AGENTS.md", "CLAUDE.md"]
 
 [pr_reviewer]
-require_score_review = false
+require_score_review = true
 require_tests_review = true
 require_security_review = true
 require_estimate_effort_to_review = true
+require_can_be_split_review = true
+require_todo_scan = true
+require_ticket_analysis_review = true
+require_risk_assessment = true
+require_merge_recommendation = true
+require_priority_files = true
 persistent_comment = true
+persistent_finding_state = true
+inline_key_issues = true
+num_max_findings = 5
 enable_review_labels_security = true
 enable_review_labels_effort = true
+enable_large_pr_chunking = true
 publish_output_no_suggestions = true
 
 [pr_description]
 enable_pr_type = true
 enable_pr_description = true
 enable_pr_diagram = true
+enable_semantic_files_types = true
 collapsible_file_list = "adaptive"
+enable_large_pr_handling = true
+publish_labels = true
 
 [pr_code_suggestions]
-commitable_code_suggestions = true
+commitable_code_suggestions = false
+dual_publishing_score_threshold = 6
 focus_only_on_problems = true
+persistent_comment = true
 num_code_suggestions_per_chunk = 4
+suggestions_score_threshold = 0
+new_score_mechanism = true
+demand_code_suggestions_self_review = true
+
+[github]
+ignore_bot_pr = false
+try_fix_invalid_inline_comments = true
 
 [github_app]
 pr_commands = [
     "/describe",
     "/review",
     "/improve",
-    "/autofix",
 ]
 handle_push_trigger = true
 push_commands = [
     "/review",
     "/improve",
-    "/autofix",
 ]
 
 [github_action_config]
@@ -51,5 +79,4 @@ handle_push_trigger = true
 push_commands = [
     "/review",
     "/improve",
-    "/autofix",
 ]

@@ -34,6 +34,13 @@ import urllib.request
 from pathlib import Path
 
 DEFAULT_MODEL = "gemini-3.8-flash"
+FALLBACK_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.5-flash",
+    "gemini-2.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash",
+]
 MAX_FILE_BYTES = 80_000
 MAX_CONTEXT_FILES = 12
 
@@ -106,29 +113,34 @@ def read_file_context(paths):
 
 
 def call_gemini(api_key, model, prompt):
-    """Invoke Gemini, expecting a JSON object per the prompt's schema."""
-    url = ("https://generativelanguage.googleapis.com/v1beta/models/"
-           f"{model}:generateContent?key={api_key}")
+    """Invoke Gemini with automatic model fallback on 503/429/404/timeout."""
+    primary = (model or DEFAULT_MODEL).removeprefix("gemini/")
+    candidates = [primary] + [m for m in FALLBACK_MODELS if m != primary]
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.1, "responseMimeType": "application/json"},
     }
-    req = urllib.request.Request(
-        url, data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
-            return json.loads(text)
-    except urllib.error.HTTPError as e:
-        print(f"Gemini API Error {e.code}: {e.read().decode('utf-8', errors='ignore')[:500]}",
-              file=sys.stderr)
-        return None
-    except Exception as e:
-        print(f"Gemini request failed: {e}", file=sys.stderr)
-        return None
+    body_bytes = json.dumps(payload).encode("utf-8")
+
+    for candidate in candidates:
+        url = ("https://generativelanguage.googleapis.com/v1beta/models/"
+               f"{candidate}:generateContent?key={api_key}")
+        req = urllib.request.Request(
+            url, data=body_bytes,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                text = data["candidates"][0]["content"]["parts"][0]["text"]
+                return json.loads(text)
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="ignore")[:300]
+            print(f"Gemini API Error {e.code} on {candidate}: {err_body}",
+                  file=sys.stderr)
+        except Exception as e:
+            print(f"Gemini request failed on {candidate}: {e}", file=sys.stderr)
+    return None
 
 
 def gh_api_get(path):
@@ -223,7 +235,13 @@ def get_review_findings(repo, pr_number):
         author = (c.get("user") or {}).get("login")
         if not body or body.strip() == "/autofix":
             continue
-        if author in ("github-actions[bot]",) and len(body) > 200:
+        if body.startswith(("Autonomous ", "Autofix ")):
+            continue
+        if "No code suggestions found" in body:
+            continue
+        if "No major issues detected" in body and "Recommended Focus Areas" not in body and "Key Issues to Review" not in body:
+            continue
+        if author in ("github-actions[bot]", "qodo-code-review[bot]") and len(body) > 200:
             summaries.append(body[:3000])
     for s in summaries[-2:]:
         findings.append({"path": None, "line": None, "start_line": None,
@@ -496,7 +514,7 @@ def review_fix_mode(api_key, model, repo, pr_number, head_ref, base_ref):
     summary, repaired = apply_repair_files(result, allowed)
     if not repaired:
         print("Gemini returned no applicable fixes.")
-        if pr_number:
+        if pr_number and os.environ.get("TRIGGER_EVENT") in ("issue_comment", "workflow_dispatch"):
             post_pr_comment(pr_number,
                 "Autofix reviewed the AI reviewer's findings and determined no code changes were warranted.")
         return True  # handled: nothing to fix
@@ -535,7 +553,7 @@ def ci_fix_mode(api_key, model, pr_number, head_ref, base_ref):
     code, stdout, stderr = run_cmd(test_cmd, cwd=test_cwd)
     if code == 0:
         print("Validation succeeded — build and tests are passing!")
-        if pr_number:
+        if pr_number and os.environ.get("TRIGGER_EVENT") in ("issue_comment", "workflow_dispatch"):
             post_pr_comment(pr_number,
                 f"Autonomous verification: `{test_cmd}` passed with 0 errors. No code repairs required.")
         return True
@@ -810,6 +828,14 @@ def main():
     pr_number = os.environ.get("PR_NUMBER")
     head_ref = os.environ.get("HEAD_REF")
     base_ref = os.environ.get("BASE_REF", "origin/main")
+    trigger_event = os.environ.get("TRIGGER_EVENT", "")
+
+    if trigger_event in ("workflow_run", "check_suite"):
+        _, log_out, _ = run_cmd(f"git log {base_ref}..HEAD --oneline --grep='^fix(autofix):'")
+        rounds = len([ln for ln in log_out.splitlines() if ln.strip()])
+        if rounds >= 3:
+            print(f"==> Autofix already applied {rounds} round(s) on this PR; skipping auto-run.")
+            sys.exit(0)
 
     print(f"==> Starting autonomous fixer with model: {model} (PR #{pr_number})")
 
