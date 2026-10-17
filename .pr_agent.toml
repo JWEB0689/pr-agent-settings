@@ -3,12 +3,11 @@
 # github.com/JWEB0689/pr-agent-settings/.pr_agent.toml
 
 [config]
-model = "gemini/gemini-3.8-flash"
+model = "gemini/gemini-2.5-flash"
 fallback_models = [
-    "gemini/gemini-3.5-flash",
-    "gemini/gemini-2.5-flash",
-    "gemini/gemini-3.5-flash-lite",
-    "gemini/gemini-3.1-flash",
+    "gemini/gemini-2.0-flash",
+    "gemini/gemini-1.5-flash",
+    "gemini/gemini-2.5-flash-lite",
 ]
 git_provider = "github"
 ai_timeout = 90
@@ -46,7 +45,7 @@ enable_large_pr_handling = true
 publish_labels = true
 
 [pr_code_suggestions]
-commitable_code_suggestions = false
+commitable_code_suggestions = true
 dual_publishing_score_threshold = 6
 focus_only_on_problems = true
 persistent_comment = true
@@ -64,6 +63,7 @@ pr_commands = [
     "/describe",
     "/review",
     "/improve",
+    "/sign-off",
 ]
 handle_push_trigger = true
 push_commands = [
