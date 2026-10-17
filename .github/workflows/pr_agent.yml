@@ -26,7 +26,6 @@ jobs:
       issues: write
       pull-requests: write
       contents: write
-      checks: write
     steps:
       - name: Resolve PR Number and Head Ref
         id: meta

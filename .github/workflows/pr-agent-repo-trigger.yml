@@ -14,7 +14,6 @@ permissions:
   contents: write
   pull-requests: write
   issues: write
-  checks: write
 
 jobs:
   # Auto-review on PR events and /review or /describe comments
