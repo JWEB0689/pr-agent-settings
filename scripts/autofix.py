@@ -24,6 +24,7 @@ Env:
   GH_TOKEN         GitHub token for the gh CLI
 """
 
+import base64
 import json
 import os
 import re
@@ -75,10 +76,12 @@ def detect_test_runner(modified_files):
     if any(f.startswith("v2/") for f in modified_files) and os.path.isfile("v2/Cargo.toml"):
         return "v2", "cargo check --workspace --no-default-features"
     if any(f.startswith("ui/mobile/") for f in modified_files) and os.path.isfile("ui/mobile/package.json"):
-        return "ui/mobile", "npm test --if-present"
+        return "ui/mobile", "npm test --if-present" if os.path.isdir("ui/mobile/node_modules") else None
     if os.path.isfile("Cargo.toml"):
         return ".", "cargo check --workspace"
     if os.path.isfile("package.json"):
+        if not os.path.isdir("node_modules"):
+            return ".", None
         try:
             with open("package.json") as f:
                 scripts = json.load(f).get("scripts", {})
@@ -250,17 +253,36 @@ def get_review_findings(repo, pr_number):
 
 
 SUGGESTION_RE = re.compile(r"```suggestion[^\n]*\n(.*?)\n```", re.DOTALL)
+MUSE_FIXES_RE = re.compile(r"<!-- muse-fixes-b64:([A-Za-z0-9+/=]+) -->")
 
 
 def extract_suggestions(findings):
-    """Pull ```suggestion blocks out of review comments.
+    """Pull ```suggestion blocks and muse-fixes-b64 payloads out of review comments.
 
     Returns [{path, start, end, code, author}]; line numbers are 1-based
     positions in the reviewed file, matching GitHub's "commit suggestion"
     semantics (the block replaces those lines).
     """
     out = []
+    seen = set()
     for f in findings:
+        body = f.get("body") or ""
+        for bm in MUSE_FIXES_RE.finditer(body):
+            try:
+                decoded = json.loads(base64.b64decode(bm.group(1)).decode("utf-8"))
+                for item in decoded:
+                    p = item.get("path")
+                    st = int(item.get("start") or 0)
+                    en = int(item.get("end") or st)
+                    code = item.get("code")
+                    key = (p, st, en)
+                    if p and st > 0 and en >= st and code is not None and key not in seen:
+                        seen.add(key)
+                        out.append({"path": p, "start": st, "end": en,
+                                    "code": code.rstrip("\n"), "author": "gemini-muse"})
+            except Exception as e:
+                print(f"Failed decoding muse-fixes-b64: {e}", file=sys.stderr)
+
         path = f.get("path")
         if not path:
             continue
@@ -271,9 +293,12 @@ def extract_suggestions(findings):
             continue
         if not start or not end or start > end:
             continue
-        for m in SUGGESTION_RE.finditer(f.get("body") or ""):
-            out.append({"path": path, "start": start, "end": end,
-                        "code": m.group(1), "author": f.get("author")})
+        for m in SUGGESTION_RE.finditer(body):
+            key = (path, start, end)
+            if key not in seen:
+                seen.add(key)
+                out.append({"path": path, "start": start, "end": end,
+                            "code": m.group(1), "author": f.get("author")})
     return out
 
 
@@ -443,11 +468,63 @@ def verify_commit_push(summary, repaired_files, test_cwd, test_cmd,
         print("Pushed successfully!")
 
     if pr_number:
+        _, diff_out, _ = run_cmd("git show --stat --patch HEAD")
+        diff_snippet = "\n".join(diff_out.splitlines()[:80])
         files_md = "\n".join(f"- `{f}`" for f in repaired_files)
-        post_pr_comment(pr_number,
-            f"Autonomous AI repair applied\n\n**Summary:** {summary}\n\n"
-            f"**Files repaired:**\n{files_md}\n\n"
-            f"**Verification:** {verify_note}\n**Commit:** `{sha}`")
+        muse_cat = "https://raw.githubusercontent.com/JWEB0689/pr-agent-settings/main/assets/muse-cat.svg"
+        fixer_body = (
+            f"<!-- muse-qodo:fixer -->\n"
+            f"### <img src=\"{muse_cat}\" width=\"24\" align=\"absmiddle\" alt=\"Muse\"> Gemini Muse Fixer\n\n"
+            f"✅ Committed ({len(repaired_files)}) · ☑ Fixed ({len(repaired_files)})\n\n"
+            f"**Summary:** {summary}\n"
+            f"**Verification:** {verify_note} · **Commit:** `{sha}`\n\n"
+            f"<details open>\n<summary><b>🔧 Applied Fix Diff ({len(repaired_files)} file(s))</b></summary>\n\n"
+            f"```diff\n{diff_snippet}\n```\n\n</details>\n"
+        )
+        token, repo = os.environ.get("GH_TOKEN"), os.environ.get("REPO")
+        updated = False
+        if token and repo:
+            for c in gh_api_get(f"/repos/{repo}/issues/{pr_number}/comments") or []:
+                cbody = c.get("body") or ""
+                if "<!-- muse-qodo:fixer -->" in cbody:
+                    cid = c["id"]
+                    req = urllib.request.Request(
+                        f"https://api.github.com/repos/{repo}/issues/comments/{cid}",
+                        data=json.dumps({"body": fixer_body}).encode("utf-8"),
+                        headers={"Accept": "application/vnd.github+json",
+                                 "X-GitHub-Api-Version": "2022-11-28",
+                                 "Authorization": f"Bearer {token}",
+                                 "User-Agent": "autofix-bot",
+                                 "Content-Type": "application/json"},
+                        method="PATCH")
+                    try:
+                        with urllib.request.urlopen(req, timeout=30):
+                            updated = True
+                    except Exception:
+                        pass
+                elif "<!-- muse-qodo:review -->" in cbody and "<!-- muse-sign-off -->" in cbody:
+                    cid = c["id"]
+                    new_rbody = re.sub(
+                        r"- \[[xX ]\] <!-- muse-sign-off -->.*",
+                        f"- [x] <!-- muse-signed-off --> ✅ **Signed off & committed in `{sha}`**",
+                        cbody,
+                    )
+                    req = urllib.request.Request(
+                        f"https://api.github.com/repos/{repo}/issues/comments/{cid}",
+                        data=json.dumps({"body": new_rbody}).encode("utf-8"),
+                        headers={"Accept": "application/vnd.github+json",
+                                 "X-GitHub-Api-Version": "2022-11-28",
+                                 "Authorization": f"Bearer {token}",
+                                 "User-Agent": "autofix-bot",
+                                 "Content-Type": "application/json"},
+                        method="PATCH")
+                    try:
+                        with urllib.request.urlopen(req, timeout=30):
+                            pass
+                    except Exception:
+                        pass
+        if not updated:
+            post_pr_comment(pr_number, fixer_body)
     return True
 
 
@@ -828,6 +905,23 @@ def main():
     head_ref = os.environ.get("HEAD_REF")
     base_ref = os.environ.get("BASE_REF", "origin/main")
     trigger_event = os.environ.get("TRIGGER_EVENT", "")
+
+    if trigger_event == "workflow_run" and repo and pr_number:
+        print(f"==> Running Qodo-style PR Summary & Code Review for PR #{pr_number}...")
+        qodo_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qodo_review.py")
+        if not os.path.isfile(qodo_script):
+            qodo_script = "/tmp/qodo_review.py"
+            if not os.path.isfile(qodo_script):
+                run_cmd(
+                    "curl -fsSL https://raw.githubusercontent.com/JWEB0689/pr-agent-settings/main/scripts/qodo_review.py -o /tmp/qodo_review.py"
+                )
+        if os.path.isfile(qodo_script):
+            run_cmd([sys.executable, qodo_script], capture=False)
+        # Only proceed with automatic code commits on workflow_run if CI checks are failing;
+        # otherwise wait for the user to click Sign-Off (/sign-off or checkbox).
+        if not get_pr_ci_failures(repo, pr_number):
+            print("==> Qodo-style review posted. Waiting for user Sign-Off to commit review fixes.")
+            sys.exit(0)
 
     if trigger_event in ("workflow_run", "check_suite"):
         _, log_out, _ = run_cmd(f"git log {base_ref}..HEAD --oneline --grep='^fix(autofix):'")

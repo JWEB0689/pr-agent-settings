@@ -1,75 +1,38 @@
-# PR-Agent Central Configuration
+# PR-Agent Central Configuration (`Gemini Muse`)
 
-This repository houses the central configuration file (`.pr_agent.toml`) and reusable workflows for [PR-Agent](https://github.com/the-pr-agent/pr-agent) across all repositories owned by [@JWEB0689](https://github.com/JWEB0689).
+<p align="center">
+  <img src="assets/muse-cat.svg" width="96" alt="Gemini Muse Cat" />
+  <br/>
+  <img src="assets/muse-logo.svg" width="220" alt="Gemini Muse Logo" />
+</p>
 
-## How It Works
+This repository houses the central configuration (`.pr_agent.toml`), Qodo-parity review engine ([`scripts/qodo_review.py`](scripts/qodo_review.py)), autonomous repair engine ([`scripts/autofix.py`](scripts/autofix.py)), and reusable GitHub Actions workflows across all repositories owned by [@JWEB0689](https://github.com/JWEB0689).
 
-1. **Global Settings Inheritance**:
-   PR-Agent automatically looks up `JWEB0689/pr-agent-settings` and loads `.pr_agent.toml` on every PR across all repositories owned by `@JWEB0689`.
-   See the [PR-Agent Global Configuration Documentation](https://docs.pr-agent.ai/usage-guide/configuration_options/#global-configuration-file).
+## What Gets Posted on Every PR
 
-2. **Repository Overrides**:
-   Any repository can define its own `.pr_agent.toml` to customize tool behavior. Repository-level configurations override these global defaults.
+On every Pull Request (`opened`, `reopened`, `synchronize`, or `/review`), **Gemini Muse** posts and updates three Qodo-style comments:
 
-3. **Reusable Workflows**:
-   - `.github/workflows/pr_agent.yml` — PR-Agent auto-review (called by per-repo workflows).
-   - `.github/workflows/reusable_autofix.yml` — autonomous CI auto-fixer with `pr` and `scheduled` modes.
+1. **PR Summary by Gemini Muse**:
+   - One-line headline + type & effort badges (`🐞 Bug fix`, `⚙️ Configuration changes`, `🕐 10-20 Minutes`)
+   - **AI Description** bullet summary
+   - **Diagram** (`mermaid` `graph TD` flowchart of the PR changes)
+   - **High-Level Assessment** with alternative approaches (`➕` pros / `➖` cons) and a **Recommendation**
+   - **Files changed (`+X / -Y`)** grouped semantically (`Bug fix`, `Enhancement`, `Configuration`, `Other`) with per-file summaries and direct `#diff-...` links
 
-4. **Interactive Commands**:
-   Comment on any Pull Request:
-   - `/review` — Full code review with security, test, risk, effort, and merge-recommendation analysis.
-   - `/describe` — PR description, changelog, and Mermaid diagram walkthrough.
-   - `/improve` — Commit-ready inline code suggestions.
-   - `/ask <question>` — Ask specific questions about the PR changes.
-   - `/sign-off` — **Apply every PR-Agent code suggestion and commit in one shot** (see setup below).
+2. **Code Review by Gemini Muse**:
+   - Category counters: `🐞 Bugs (X)` · `📘 Rule violations (Y)` · `📎 Requirement gaps (Z)`
+   - **Zero-issues state**: Displays the **Gemini Muse Cat** illustration + *"Great, no issues found!"*
+   - **Actionable findings**: Grouped by severity (`High`, `Medium`, `Low`), each expandable with:
+     - **Description** of the bug/risk
+     - **Code & Fix Diff** (`diff` block showing `-` original and `+` fixed code + file line links)
+     - **Evidence** from the diff/codebase
+     - **Agent prompt** — ready-to-copy prompt block (`## Issue description`, `## Fix Focus Areas`, `## Recommended Fix`) for AI coding tools
+   - **Inline GitHub `suggestion` comments** for one-click per-line commits
 
-## Per-Repository Setup (required for PR-Agent to run)
+3. **Gemini Muse Fixer & 1-Click Sign-Off**:
+   - Displays the combined **Proposed Fix Diff** across all flagged files
+   - **1-Click Sign-Off Checkbox**: Tick `- [ ] 🚀 Sign-Off & Commit All Fixes` directly in the comment (or comment `/sign-off` / `/autofix`) to apply all fixes, verify with the repo's test runner, and commit to the PR branch.
 
-Each repository must add a trigger workflow that calls the reusable workflows here. Copy `.github/workflows/pr-agent-repo-trigger.yml` from this repo into the target repo's `.github/workflows/` directory:
+## Per-Repository Setup
 
-```yaml
-name: PR-Agent + Sign-off
-
-on:
-  pull_request:
-    types: [opened, reopened, synchronize]
-  issue_comment:
-    types: [created]
-
-permissions:
-  contents: write
-  pull-requests: write
-  issues: write
-
-jobs:
-  pr_agent:
-    if: ${{ github.event_name == 'pull_request' || (github.event.issue.pull_request && github.event.sender.type != 'Bot') }}
-    uses: JWEB0689/pr-agent-settings/.github/workflows/pr_agent.yml@main
-    secrets:
-      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-
-  sign-off:
-    if: ${{ github.event_name == 'issue_comment' && github.event.issue.pull_request && contains(github.event.comment.body, '/sign-off') && github.event.sender.type != 'Bot' }}
-    uses: JWEB0689/pr-agent-settings/.github/workflows/reusable_autofix.yml@main
-    with:
-      mode: pr
-      pr_number: ${{ github.event.issue.number }}
-    secrets:
-      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-```
-
-Then add the `GEMINI_API_KEY` secret to each repo: Settings → Secrets and variables → Actions → New repository secret.
-
-## Sign-Off Flow
-
-1. PR-Agent posts `/review` findings with GitHub **Commit suggestion** buttons on each fix.
-2. Comment `/sign-off` on the PR to apply **all** suggestions at once and commit them to the PR branch.
-3. The autofix engine verifies the changes with the repo's test/build command before committing; on failure it rolls back and comments on the PR.
-
-## Diagram Walkthrough
-
-`/describe` generates a PR description with a Mermaid diagram walkthrough (`enable_pr_diagram = true` in `.pr_agent.toml`).
-
-## Model
-
-Uses Google AI Studio Gemini via `GEMINI_API_KEY`. Current model: `gemini/gemini-2.5-flash` with fallbacks `gemini/gemini-2.0-flash`, `gemini/gemini-1.5-flash`, `gemini/gemini-2.5-flash-lite`.
+Copy [`.github/workflows/pr-agent-repo-trigger.yml`](.github/workflows/pr-agent-repo-trigger.yml) into the target repo's `.github/workflows/` directory and ensure the `GEMINI_API_KEY` secret is configured.

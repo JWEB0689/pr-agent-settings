@@ -196,6 +196,7 @@ jobs:
           BRANCH: ${{ steps.meta.outputs.branch }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          curl -fsSL https://raw.githubusercontent.com/JWEB0689/pr-agent-settings/main/scripts/qodo_review.py -o /tmp/qodo_review.py
           curl -fsSL https://raw.githubusercontent.com/JWEB0689/pr-agent-settings/main/scripts/autofix.py -o /tmp/autofix.py
-          chmod +x /tmp/autofix.py
+          chmod +x /tmp/qodo_review.py /tmp/autofix.py
           python3 /tmp/autofix.py

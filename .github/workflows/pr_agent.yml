@@ -5,15 +5,22 @@ on:
     inputs:
       model:
         type: string
-        default: "gemini/gemini-2.5-flash"
-        description: "Model to use for PR-Agent"
+        default: "gemini-2.5-flash"
+        description: "Model to use for Gemini Muse Qodo-style Review"
     secrets:
       GEMINI_API_KEY:
         required: true
 
 jobs:
   pr_agent_job:
-    if: ${{ (github.event_name == 'pull_request') || (github.event_name == 'issue_comment' && github.event.issue.pull_request && github.event.sender.type != 'Bot' && !startsWith(github.event.comment.body, '/autofix')) }}
+    if: >-
+      (github.event_name == 'pull_request') ||
+      (github.event_name == 'issue_comment' &&
+       github.event.action == 'created' &&
+       github.event.issue.pull_request &&
+       github.event.sender.type != 'Bot' &&
+       !contains(github.event.comment.body, '/autofix') &&
+       !contains(github.event.comment.body, '/sign-off'))
     runs-on: ubuntu-latest
     permissions:
       issues: write
@@ -21,28 +28,35 @@ jobs:
       contents: write
       checks: write
     steps:
-      - name: PR Agent action step
-        id: pragent
-        uses: the-pr-agent/pr-agent@main
+      - name: Resolve PR Number and Head Ref
+        id: meta
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            PR_NUM="${{ github.event.pull_request.number }}"
+            HEAD_REF="${{ github.event.pull_request.head.ref }}"
+          else
+            PR_NUM="${{ github.event.issue.number }}"
+            HEAD_REF=$(gh pr view "$PR_NUM" --repo "${{ github.repository }}" --json headRefName --jq .headRefName)
+          fi
+          echo "pr_number=$PR_NUM" >> "$GITHUB_OUTPUT"
+          echo "head_ref=$HEAD_REF" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout PR Branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.meta.outputs.head_ref }}
+          fetch-depth: 0
+
+      - name: Run Gemini Muse Qodo-Style Review
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GOOGLE_AI_STUDIO.GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          config.model: ${{ inputs.model }}
-          config.fallback_models: '["gemini/gemini-2.0-flash", "gemini/gemini-1.5-flash", "gemini/gemini-2.5-flash-lite"]'
-          config.ai_timeout: "90"
-          config.retry_same_model_on_timeout: "false"
-          github.ignore_bot_pr: "false"
-          github_action_config.auto_review: "true"
-          github_action_config.auto_describe: "true"
-          github_action_config.auto_improve: "true"
-          github_action_config.handle_push_trigger: "true"
-          github_action_config.push_commands: '["/review", "/improve"]'
-          pr_code_suggestions.commitable_code_suggestions: "false"
-          pr_code_suggestions.dual_publishing_score_threshold: "6"
-          pr_reviewer.require_security_review: "true"
-          pr_reviewer.require_tests_review: "true"
-          pr_reviewer.require_risk_assessment: "true"
-          pr_reviewer.require_merge_recommendation: "true"
-          pr_reviewer.require_priority_files: "true"
-          pr_reviewer.inline_key_issues: "true"
+          GEMINI_MODEL: ${{ inputs.model }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.meta.outputs.pr_number }}
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/JWEB0689/pr-agent-settings/main/scripts/qodo_review.py -o /tmp/qodo_review.py
+          python3 /tmp/qodo_review.py
