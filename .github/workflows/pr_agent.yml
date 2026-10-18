@@ -43,7 +43,7 @@ jobs:
           echo "head_ref=$HEAD_REF" >> "$GITHUB_OUTPUT"
 
       - name: Checkout PR Branch
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ steps.meta.outputs.head_ref }}
           fetch-depth: 0
