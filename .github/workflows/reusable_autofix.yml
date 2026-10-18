@@ -143,7 +143,7 @@ jobs:
 
       - name: Checkout PR Branch
         if: steps.meta.outputs.mode == 'pr'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ steps.meta.outputs.head_ref }}
           fetch-depth: 0
@@ -151,7 +151,7 @@ jobs:
 
       - name: Checkout base commit
         if: steps.meta.outputs.mode == 'scheduled'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ inputs.head_sha }}
           fetch-depth: 0
@@ -162,7 +162,7 @@ jobs:
         run: git checkout -b "${{ steps.meta.outputs.branch }}"
 
       - name: Setup Node & Rust Toolchains
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 20
         continue-on-error: true
@@ -174,7 +174,7 @@ jobs:
 
       - name: Setup Python Toolchain (if pyproject/requirements exist)
         if: hashFiles('**/pyproject.toml', '**/requirements.txt') != ''
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
         continue-on-error: true
