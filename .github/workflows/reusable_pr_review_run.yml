@@ -1,0 +1,80 @@
+name: PR-Agent Privileged Review (workflow_run stage)
+
+# Second stage of the two-stage Dependabot review pipeline.
+# Stage 1 (per-repo "PR-Agent Collect", runs on pull_request) has no secrets
+# and a read-only token, so it only uploads a pr-context artifact.
+# This stage is called from a per-repo workflow_run workflow, which runs in
+# the default-branch context: Actions secrets are available and the token can
+# write, so the Qodo-style review can actually post its comments.
+# The review script is always fetched from this repo's main branch; PR code
+# is checked out for read-only context only and is never executed.
+
+on:
+  workflow_call:
+    inputs:
+      source_run_id:
+        type: string
+        required: true
+        description: "Run ID of the PR-Agent Collect run that uploaded pr-context"
+      model:
+        type: string
+        default: "gemini-3.8-flash"
+        description: "Model to use for Gemini Muse Qodo-style Review"
+    secrets:
+      GEMINI_API_KEY:
+        required: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Download PR context artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: pr-context
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: /tmp/pr-context
+
+      - name: Read PR context
+        id: ctx
+        run: |
+          python3 - <<'EOF'
+          import json, os
+          ctx = json.load(open("/tmp/pr-context/pr.json"))
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(out, "a") as fh:
+              fh.write(f"pr_number={int(ctx['pr_number'])}\n")
+              fh.write(f"head_sha={ctx['head_sha']}\n")
+              fh.write(f"dependabot={str(bool(ctx['dependabot'])).lower()}\n")
+          print(ctx)
+          EOF
+
+      - name: Checkout PR head (read-only context, never executed)
+        if: steps.ctx.outputs.dependabot == 'true'
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.ctx.outputs.head_sha }}
+          fetch-depth: 1
+
+      - name: Run Gemini Muse Qodo-Style Review
+        if: steps.ctx.outputs.dependabot == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ inputs.model }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.ctx.outputs.pr_number }}
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/JWEB0689/pr-agent-settings/main/scripts/qodo_review.py -o /tmp/qodo_review.py
+          python3 /tmp/qodo_review.py
+
+      - name: Nothing to do
+        if: steps.ctx.outputs.dependabot != 'true'
+        run: echo "Not a Dependabot PR; the direct pull_request review path handles it."
