@@ -24,12 +24,10 @@ import sys
 import urllib.error
 import urllib.request
 
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-3.8-flash"
 FALLBACK_MODELS = [
+    "gemini-3.8-flash",
     "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
-    "gemini-2.5-flash-lite",
 ]
 
 ASSET_BASE = "https://raw.githubusercontent.com/JWEB0689/pr-agent-settings/main/assets"
