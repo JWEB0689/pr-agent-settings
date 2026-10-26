@@ -18,7 +18,7 @@ on:
         description: "pr | scheduled"
       model:
         type: string
-        default: "gemini-2.5-flash"
+        default: "gemini-3.8-flash"
         description: "Gemini model to use"
       pr_number:
         type: string
@@ -61,7 +61,7 @@ on:
       model:
         description: "Gemini Model"
         required: false
-        default: "gemini-2.5-flash"
+        default: "gemini-3.8-flash"
         type: string
 
 permissions:
@@ -183,7 +183,7 @@ jobs:
         if: steps.meta.outputs.mode != 'skip'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: ${{ inputs.model || 'gemini-2.5-flash' }}
+          GEMINI_MODEL: ${{ inputs.model || 'gemini-3.8-flash' }}
           MODE: ${{ steps.meta.outputs.mode }}
           TRIGGER_EVENT: ${{ github.event_name }}
           REPO: ${{ github.repository }}
