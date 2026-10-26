@@ -5,7 +5,7 @@ on:
     inputs:
       model:
         type: string
-        default: "gemini-2.5-flash"
+        default: "gemini-3.8-flash"
         description: "Model to use for Gemini Muse Qodo-style Review"
     secrets:
       GEMINI_API_KEY:
