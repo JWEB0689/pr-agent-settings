@@ -534,10 +534,11 @@ RESOLVE_TICK_RE = re.compile(r"- \[[xX]\] <!-- muse-resolve:([0-9a-f]{8}) -->")
 DONE_RE = re.compile(r"<!-- muse-(?:applied|resolved):([0-9a-f]{8}) -->")
 
 
-def selection_state(findings):
-    """Checkbox state from the fixer comment: (fix_ticks, resolve_ticks, done_ids)."""
-    for f in findings:
-        body = f.get("body") or ""
+def selection_state(repo, pr_number):
+    """Checkbox state read from the live fixer comment (full body, untruncated):
+    (fix_ticks, resolve_ticks, done_ids)."""
+    for c in gh_api_get(f"/repos/{repo}/issues/{pr_number}/comments") or []:
+        body = c.get("body") or ""
         if "<!-- muse-qodo:fixer -->" in body:
             done = set(DONE_RE.findall(body))
             return (set(FIX_TICK_RE.findall(body)) - done,
@@ -627,7 +628,7 @@ def review_fix_mode(api_key, model, repo, pr_number, head_ref, base_ref):
 
     # Step 1: apply ```suggestion blocks deterministically (exact + free).
     suggestions = extract_suggestions(findings)
-    fix_ticks, resolve_ticks, done_ids = selection_state(findings)
+    fix_ticks, resolve_ticks, done_ids = selection_state(repo, pr_number)
     if fix_ticks or resolve_ticks:
         return selection_mode(api_key, model, repo, pr_number, head_ref,
                               findings, fix_ticks, resolve_ticks)
