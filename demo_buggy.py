@@ -6,7 +6,9 @@ def get_user(db, user_id):
     return db.execute(query)
 
 
-def add_item(item, items=[]):
+def add_item(item, items=None):
+    if items is None:
+        items = []
     items.append(item)
     return items
 
