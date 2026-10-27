@@ -43,13 +43,31 @@ jobs:
           echo "pr_number=$PR_NUM" >> "$GITHUB_OUTPUT"
           echo "head_ref=$HEAD_REF" >> "$GITHUB_OUTPUT"
 
+      - name: Handle /ask and /describe commands
+        id: cmd
+        if: ${{ github.event_name == 'issue_comment' && (startsWith(github.event.comment.body, '/ask') || startsWith(github.event.comment.body, '/describe')) }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ inputs.model }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.meta.outputs.pr_number }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/JWEB0689/pr-agent-settings/main/scripts/pr_commands.py -o /tmp/pr_commands.py
+          python3 /tmp/pr_commands.py
+          echo "handled=true" >> "$GITHUB_OUTPUT"
+
       - name: Checkout PR Branch
+        if: ${{ steps.cmd.outputs.handled != 'true' }}
         uses: actions/checkout@v5
         with:
           ref: ${{ steps.meta.outputs.head_ref }}
           fetch-depth: 0
 
       - name: Run Gemini Muse Qodo-Style Review
+        if: ${{ steps.cmd.outputs.handled != 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
