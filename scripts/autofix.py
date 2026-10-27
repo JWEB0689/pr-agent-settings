@@ -277,7 +277,7 @@ def extract_suggestions(findings):
                     if p and st > 0 and en >= st and code is not None and key not in seen:
                         seen.add(key)
                         out.append({"path": p, "start": st, "end": en,
-                                    "code": code.rstrip("\n"), "author": "gemini-muse"})
+                                    "code": code.rstrip("\n"), "author": "gemini-muse", "id": item.get("id")})
             except Exception as e:
                 print(f"Failed decoding muse-fixes-b64: {e}", file=sys.stderr)
 
@@ -528,6 +528,91 @@ def verify_commit_push(summary, repaired_files, test_cwd, test_cmd,
 
 # ---------------------------------------------------------------- modes
 
+
+FIX_TICK_RE = re.compile(r"- \[[xX]\] <!-- muse-fix:([0-9a-f]{8}) -->")
+RESOLVE_TICK_RE = re.compile(r"- \[[xX]\] <!-- muse-resolve:([0-9a-f]{8}) -->")
+DONE_RE = re.compile(r"<!-- muse-(?:applied|resolved):([0-9a-f]{8}) -->")
+
+
+def selection_state(findings):
+    """Checkbox state from the fixer comment: (fix_ticks, resolve_ticks, done_ids)."""
+    for f in findings:
+        body = f.get("body") or ""
+        if "<!-- muse-qodo:fixer -->" in body:
+            done = set(DONE_RE.findall(body))
+            return (set(FIX_TICK_RE.findall(body)) - done,
+                    set(RESOLVE_TICK_RE.findall(body)) - done,
+                    done)
+    return set(), set(), set()
+
+
+def update_fixer_checkbox_state(repo, pr_number, applied_ids, resolved_ids, sha=None):
+    """Flip processed per-finding checkbox lines in the fixer comment."""
+    token = os.environ.get("GH_TOKEN")
+    if not token or not repo:
+        return
+    for c in gh_api_get(f"/repos/{repo}/issues/{pr_number}/comments") or []:
+        cbody = c.get("body") or ""
+        if "<!-- muse-qodo:fixer -->" not in cbody:
+            continue
+        new = cbody
+        for fid in applied_ids:
+            sha_txt = f" in `{sha}`" if sha else ""
+            new = re.sub(rf"- \[[ xX]\] <!-- muse-fix:{fid} -->[^\n]*",
+                         f"- [x] <!-- muse-applied:{fid} --> ✅ **Committed{sha_txt}**", new)
+            new = re.sub(rf"- \[[ xX]\] <!-- muse-resolve:{fid} -->[^\n]*",
+                         f"<!-- muse-resolve-void:{fid} -->", new)
+        for fid in resolved_ids:
+            new = re.sub(rf"- \[[ xX]\] <!-- muse-fix:{fid} -->[^\n]*",
+                         f"- [ ] <!-- muse-fix-void:{fid} --> 🚫 **Not applied** — finding resolved", new)
+            new = re.sub(rf"- \[[ xX]\] <!-- muse-resolve:{fid} -->[^\n]*",
+                         f"- [x] <!-- muse-resolved:{fid} --> 🗑️ **Resolved — dismissed by reviewer**", new)
+        if new != cbody:
+            req = urllib.request.Request(
+                f"https://api.github.com/repos/{repo}/issues/comments/{c['id']}",
+                data=json.dumps({"body": new}).encode("utf-8"),
+                headers={"Accept": "application/vnd.github+json",
+                         "X-GitHub-Api-Version": "2022-11-28",
+                         "Authorization": f"Bearer {token}",
+                         "User-Agent": "autofix-bot",
+                         "Content-Type": "application/json"},
+                method="PATCH")
+            try:
+                with urllib.request.urlopen(req, timeout=30):
+                    pass
+            except Exception as e:
+                print(f"Failed updating fixer checkbox state: {e}", file=sys.stderr)
+        return
+
+
+def selection_mode(api_key, model, repo, pr_number, head_ref, findings,
+                   fix_ticks, resolve_ticks):
+    """Apply only the fixes whose Apply box was ticked; mark resolves."""
+    print(f"==> Checkbox selection: apply={sorted(fix_ticks)} resolve={sorted(resolve_ticks)}")
+    suggestions = [s for s in extract_suggestions(findings) if s.get("id") in fix_ticks]
+    applied_ids = set()
+    sha = None
+    if suggestions:
+        n = apply_suggestions(suggestions)
+        if not n:
+            print("Selected suggestions not appliable; nothing committed.")
+            run_cmd("git checkout -- .")
+            return False
+        test_cwd, test_cmd = detect_test_runner(sorted({s["path"] for s in suggestions}))
+        ok = verify_commit_push(
+            f"Apply {n} selected review fix(es)",
+            sorted({s["path"] for s in suggestions}),
+            test_cwd, test_cmd, pr_number, head_ref, "selected review-fix")
+        if not ok:
+            print("Selected-fix verification failed; rolled back.")
+            return False
+        applied_ids = {s["id"] for s in suggestions if s.get("id")}
+        _, sha_out, _ = run_cmd("git rev-parse --short HEAD")
+        sha = sha_out.strip() or None
+    update_fixer_checkbox_state(repo, pr_number, applied_ids, set(resolve_ticks), sha)
+    return True
+
+
 def review_fix_mode(api_key, model, repo, pr_number, head_ref, base_ref):
     """Fix what the review bot flagged. Returns True if it handled the PR."""
     findings = get_review_findings(repo, pr_number)
@@ -542,6 +627,12 @@ def review_fix_mode(api_key, model, repo, pr_number, head_ref, base_ref):
 
     # Step 1: apply ```suggestion blocks deterministically (exact + free).
     suggestions = extract_suggestions(findings)
+    fix_ticks, resolve_ticks, done_ids = selection_state(findings)
+    if fix_ticks or resolve_ticks:
+        return selection_mode(api_key, model, repo, pr_number, head_ref,
+                              findings, fix_ticks, resolve_ticks)
+    if done_ids:
+        suggestions = [s for s in suggestions if s.get("id") not in done_ids]
     if suggestions:
         print(f"==> Found {len(suggestions)} suggestion block(s); applying directly.")
         n = apply_suggestions(suggestions)
