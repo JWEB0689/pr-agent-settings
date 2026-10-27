@@ -541,10 +541,17 @@ def selection_state(repo, pr_number):
         body = c.get("body") or ""
         if "<!-- muse-qodo:fixer -->" in body:
             done = set(DONE_RE.findall(body))
+            payload = []
+            m = MUSE_FIXES_RE.search(body)
+            if m:
+                try:
+                    payload = json.loads(base64.b64decode(m.group(1)).decode("utf-8"))
+                except Exception:
+                    payload = []
             return (set(FIX_TICK_RE.findall(body)) - done,
                     set(RESOLVE_TICK_RE.findall(body)) - done,
-                    done)
-    return set(), set(), set()
+                    done, payload)
+    return set(), set(), set(), []
 
 
 def update_fixer_checkbox_state(repo, pr_number, applied_ids, resolved_ids, sha=None):
@@ -587,10 +594,22 @@ def update_fixer_checkbox_state(repo, pr_number, applied_ids, resolved_ids, sha=
 
 
 def selection_mode(api_key, model, repo, pr_number, head_ref, findings,
-                   fix_ticks, resolve_ticks):
-    """Apply only the fixes whose Apply box was ticked; mark resolves."""
+                   fix_ticks, resolve_ticks, payload):
+    """Apply only the fixes whose Apply box was ticked; mark resolves.
+
+    Suggestions are built directly from the fixer comment's payload:
+    extract_suggestions() dedupes by (path, start, end) against inline
+    review comments (e.g. CodeRabbit's), which can shadow payload items.
+    """
     print(f"==> Checkbox selection: apply={sorted(fix_ticks)} resolve={sorted(resolve_ticks)}")
-    suggestions = [s for s in extract_suggestions(findings) if s.get("id") in fix_ticks]
+    suggestions = [
+        {"path": it.get("path"), "start": int(it.get("start") or 0),
+         "end": int(it.get("end") or it.get("start") or 0),
+         "code": (it.get("code") or "").rstrip("\n"),
+         "author": "gemini-muse", "id": it.get("id")}
+        for it in payload
+        if it.get("id") in fix_ticks and it.get("path") and it.get("code") is not None
+    ]
     applied_ids = set()
     sha = None
     if suggestions:
@@ -628,10 +647,10 @@ def review_fix_mode(api_key, model, repo, pr_number, head_ref, base_ref):
 
     # Step 1: apply ```suggestion blocks deterministically (exact + free).
     suggestions = extract_suggestions(findings)
-    fix_ticks, resolve_ticks, done_ids = selection_state(repo, pr_number)
+    fix_ticks, resolve_ticks, done_ids, payload = selection_state(repo, pr_number)
     if fix_ticks or resolve_ticks:
         return selection_mode(api_key, model, repo, pr_number, head_ref,
-                              findings, fix_ticks, resolve_ticks)
+                              findings, fix_ticks, resolve_ticks, payload)
     if done_ids:
         suggestions = [s for s in suggestions if s.get("id") not in done_ids]
     if suggestions:
