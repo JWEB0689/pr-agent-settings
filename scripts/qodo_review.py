@@ -42,7 +42,7 @@ FIXER_MARKER = "<!-- muse-qodo:fixer -->"
 TIPS = [
     "💡 Did you know, you can tick the 'Sign-Off & Commit All Fixes' checkbox in the review or comment /sign-off to apply and commit all fixes in one shot",
     "💡 Did you know, every finding includes a copyable 'Agent prompt' block tailored for AI coding assistants",
-    "💡 Did you know, you can comment /review, /describe, or /sign-off on any PR to re-run Gemini Muse at any time",
+    "💡 Did you know, you can comment /review or /describe to re-run Gemini Muse, /ask <question> to ask about the PR, or /sign-off to apply all fixes",
 ]
 
 
