@@ -472,6 +472,11 @@ Gemini Muse reviewed your code and found no material issues that require review"
 """
 
 
+def finding_id(f):
+    raw = f"{f.get('file')}:{f.get('start_line') or 0}-{f.get('end_line') or 0}:{f.get('title') or ''}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
+
+
 def render_fixer_comment(repo, pr_number, findings):
     if not findings:
         return f"""{FIXER_MARKER}
@@ -480,8 +485,8 @@ def render_fixer_comment(repo, pr_number, findings):
 No findings are available for this PR yet. Findings appear here once Gemini Muse identifies actionable fixes.
 """
 
-    patches = []
     fix_payload = []
+    sections = []
     for f in findings:
         fpath = f.get("file")
         st = int(f.get("start_line") or 0)
@@ -489,44 +494,45 @@ No findings are available for this PR yet. Findings appear here once Gemini Muse
         orig = f.get("original_code") or ""
         fixed = f.get("fixed_code") or ""
         if fpath and fixed:
-            patches.append(
-                f"# File: {fpath} (lines {st}-{en})\n"
-                + build_diff_snippet(orig, fixed)
-            )
+            fid = finding_id(f)
+            title = f.get("title") or "Apply review fix"
+            diff = build_diff_snippet(orig, fixed)
             fix_payload.append({
                 "path": fpath,
                 "start": st,
                 "end": en,
                 "original": orig,
                 "code": fixed,
-                "title": f.get("title") or "Apply review fix",
+                "title": title,
+                "id": fid,
             })
+            sections.append(
+                f"<details open>\n"
+                f"<summary><b>Fix {len(sections) + 1}: {html.escape(title)}</b> — <code>{html.escape(fpath)} lines {st}-{en}</code></summary>\n\n"
+                f"```diff\n{diff}\n```\n\n"
+                f"</details>\n\n"
+                f"- [ ] <!-- muse-fix:{fid} --> ✅ **Apply this fix** — commit just this change to the PR branch\n"
+                f"- [ ] <!-- muse-resolve:{fid} --> 🗑️ **Resolve / dismiss** — close this finding without applying it\n"
+            )
 
-    combined_diff = "\n\n".join(patches) if patches else "# See review findings above"
     encoded_fixes = base64.b64encode(json.dumps(fix_payload).encode("utf-8")).decode("ascii")
+    per_fix = "\n".join(sections) if sections else "# See review findings above"
 
     return f"""{FIXER_MARKER}
 <!-- muse-fixes-b64:{encoded_fixes} -->
 ### <img src="{MUSE_CAT_URL}" width="24" align="absmiddle" alt="Muse"> Gemini Muse Fixer
 
-✅ Committed (0) · 🔧 Ready to Fix ({len(findings)})
+✅ Committed (0) · 🔧 Ready to Fix ({len(fix_payload)})
 
-<details open>
-<summary><b>📋 Proposed Fix Diff ({len(fix_payload)} patch(es))</b></summary>
+Each fix below shows its exact diff. Tick **Apply this fix** to commit just that one, or **Resolve / dismiss** to close the finding without applying it — or use Sign-Off to commit them all at once.
 
-```diff
-{combined_diff}
-```
-
-</details>
-
+{per_fix}
 <br/>
 
-- [ ] <!-- muse-sign-off --> 🚀 **Sign-Off & Commit All Fixes** — Check this box (or comment `/sign-off`) to apply the diff above, run verification, and commit directly to this PR branch.
+- [ ] <!-- muse-sign-off --> 🚀 **Sign-Off & Commit All Fixes** — Check this box (or comment `/sign-off`) to apply all the fixes above, run verification, and commit directly to this PR branch.
 
 <a href="https://github.com/{repo}/pull/{pr_number}#issuecomment-new"><img src="https://img.shields.io/badge/✍️_Sign--Off_%26_Commit_Fixes-2ea44f?style=for-the-badge&logo=github" alt="Sign-Off & Commit Fixes"></a>
 """
-
 
 def upsert_comment(repo, pr_number, marker, body, existing_comments):
     for c in existing_comments:
