@@ -16,15 +16,16 @@ def add_item(item, items=None):
     return items
 
 def read_config(path):
-    # Overly broad exception catch fix: Reconstructed the function to catch a more
-    # specific FileNotFoundError. Removed redundant/broad exception catches.
+    # Overly broad exception catch fix: Catch the expected file/decoding errors
+    # (OSError covers FileNotFoundError/PermissionError/IsADirectoryError) plus
+    # UnicodeDecodeError, and return None. Let other exceptions propagate.
     # File encoding fix: The original code fragment already included encoding="utf-8".
     try:
         with open(path, encoding="utf-8") as f:
             # Assuming the function reads and returns content.
             content = f.read()
             return content
-    except FileNotFoundError:
+    except (OSError, UnicodeDecodeError):
         return None
 
 # Hardcoded sensitive information fix: The original code already uses os.getenv,
