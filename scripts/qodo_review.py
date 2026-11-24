@@ -136,6 +136,31 @@ def build_diff_snippet(orig, fixed):
     return "\n".join(out) if out else "# No line diff provided"
 
 
+def restore_first_line_indent(original, fixed):
+    """Restore a stripped first-line indent in Gemini's fixed_code.
+
+    Gemini often emits fixed_code with the first line's indentation removed
+    while later lines keep theirs. Applied verbatim, that breaks indented
+    code (e.g. a function body's first line lands at column 0). When the
+    fixed block's first line is indented less than the original's first line
+    by a pure whitespace-prefix shortfall, restore the missing prefix.
+    """
+    if not original or not fixed:
+        return fixed
+    orig_first = original.split("\n", 1)[0]
+    fixed_lines = fixed.split("\n")
+    if not fixed_lines:
+        return fixed
+    orig_indent = orig_first[:len(orig_first) - len(orig_first.lstrip())]
+    first = fixed_lines[0]
+    first_indent = first[:len(first) - len(first.lstrip())]
+    if (first.strip() and orig_indent.startswith(first_indent)
+            and len(first_indent) < len(orig_indent)):
+        fixed_lines[0] = orig_indent[len(first_indent):] + first
+        return "\n".join(fixed_lines)
+    return fixed
+
+
 def render_summary_comment(repo, pr_number, pr_files, analysis):
     s = analysis.get("summary") or {}
     headline = html.escape(s.get("headline") or "Pull request changes summary")
@@ -361,7 +386,7 @@ Gemini Muse reviewed your code and found no material issues that require review"
                 desc = html.escape(f.get("description") or "")
                 evid = html.escape(f.get("evidence") or "Identified during static analysis of the PR diff.")
                 orig = f.get("original_code") or ""
-                fixed = f.get("fixed_code") or ""
+                fixed = restore_first_line_indent(orig, f.get("fixed_code") or "")
                 diff_block = build_diff_snippet(orig, fixed)
 
                 anchor = diff_anchor(fpath)
@@ -492,7 +517,7 @@ No findings are available for this PR yet. Findings appear here once Gemini Muse
         st = int(f.get("start_line") or 0)
         en = int(f.get("end_line") or st)
         orig = f.get("original_code") or ""
-        fixed = f.get("fixed_code") or ""
+        fixed = restore_first_line_indent(orig, f.get("fixed_code") or "")
         if fpath and fixed:
             fid = finding_id(f)
             title = f.get("title") or "Apply review fix"
@@ -580,6 +605,7 @@ def post_inline_suggestions(repo, pr_number, head_sha, findings, pr_files):
         fixed = f.get("fixed_code")
         if not fpath or fpath not in valid_files or fixed is None:
             continue
+        fixed = restore_first_line_indent(f.get("original_code") or "", fixed)
         try:
             st = int(f.get("start_line") or 0)
             en = int(f.get("end_line") or st)
