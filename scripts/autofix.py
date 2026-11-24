@@ -327,7 +327,20 @@ def apply_suggestions(suggestions):
                 print(f"suggestion range out of bounds: {path}:{st}-{en} "
                       f"(file has {len(lines)} lines)")
                 return None
-            lines[st - 1:en] = s["code"].split("\n")
+            code_lines = s["code"].split("\n")
+            # Defense in depth: suggestion sources (incl. Gemini's
+            # fixed_code) often lose the first line's indentation while
+            # later lines keep theirs. Restore a pure whitespace-prefix
+            # shortfall from the original line being replaced.
+            orig_first = lines[st - 1]
+            orig_indent = orig_first[:len(orig_first) - len(orig_first.lstrip())]
+            if code_lines and code_lines[0].strip():
+                first = code_lines[0]
+                first_indent = first[:len(first) - len(first.lstrip())]
+                if (orig_indent.startswith(first_indent)
+                        and len(first_indent) < len(orig_indent)):
+                    code_lines[0] = orig_indent[len(first_indent):] + first
+            lines[st - 1:en] = code_lines
         with open(norm, "w", encoding="utf-8") as fh:
             fh.write("\n".join(lines) + ("\n" if trailing_nl else ""))
         print(f"  Applied {len(ss)} suggestion(s) to {norm}")
