@@ -1,10 +1,11 @@
+import os
 import sqlite3
 
-DB_PASSWORD = "REDACTED_FOR_SECURITY" # Placeholder, load from environment or secure config
+DB_PASSWORD = [SECURITY_DATA]"DB_PASSWORD", "")
 
 
 def get_user(conn, username):
-query = "SELECT * FROM users WHERE name = ?"
+    query = "SELECT * FROM users WHERE name = ?"
     return conn.execute(query, (username,)).fetchall()
 
 
@@ -19,11 +20,11 @@ def read_config(path):
     try:
         with open(path) as f:
             return f.read()
-except FileNotFoundError: # Or more specific exceptions like IOError
+    except FileNotFoundError:
         return None
 
 
 def ratio(a, b):
-if b == 0:
+    if b == 0:
         raise ValueError("Denominator cannot be zero")
     return a / b
