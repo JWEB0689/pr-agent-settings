@@ -57,6 +57,23 @@ def run_cmd(cmd, cwd=None, capture=True):
         return 1, "", str(e)
 
 
+def runner_unavailable(test_cmd, code, out, err):
+    """True when validation never ran because the test runner itself is
+    missing from this environment (e.g. pytest is not installed after a
+    bare checkout, so the shell exits 127). That is an environment gap,
+    not a failing fix: callers treat it as 'verification unavailable'
+    and land the fix with a warning instead of rolling back."""
+    if not test_cmd or code == 0:
+        return False
+    if code == 127:
+        return True
+    exe = test_cmd.strip().split()[0] if test_cmd.strip() else ""
+    blob = (out + "\n" + err).lower()
+    if "command not found" in blob or "no such file or directory" in blob:
+        return bool(exe) and exe.lower() in blob
+    return False
+
+
 def get_modified_files(base_ref="origin/main"):
     """Files changed on this branch vs base (fallbacks for shallow checkouts)."""
     code, out, _ = run_cmd(f"git diff --name-only {base_ref}...HEAD")
@@ -443,7 +460,14 @@ def verify_commit_push(summary, repaired_files, test_cwd, test_cmd,
     if test_cmd:
         print(f"==> Re-running validation: '{test_cmd}' in '{test_cwd}'")
         v_code, v_out, v_err = run_cmd(test_cmd, cwd=test_cwd)
-        if v_code != 0:
+        if v_code != 0 and runner_unavailable(test_cmd, v_code, v_out, v_err):
+            print(f"==> Validation runner unavailable ('{test_cmd}' is not "
+                  "installed in this environment); landing the fix "
+                  "unverified — CI will verify.")
+            verify_note = (f"⚠️ not verified locally — `{test_cmd}` is not "
+                           "available in the repair environment; landed "
+                           "unverified, CI will verify")
+        elif v_code != 0:
             print("Re-verification failed after applying fix. Rolling back.")
             run_cmd("git checkout -- .")
             if pr_number:
@@ -452,7 +476,8 @@ def verify_commit_push(summary, repaired_files, test_cwd, test_cmd,
                     f"`{test_cmd}` still failed. Changes were rolled back.\n"
                     f"```\n{(v_out + v_err)[-300:]}\n```")
             return False
-        verify_note = f"`{test_cmd}` passed"
+        else:
+            verify_note = f"`{test_cmd}` passed"
     else:
         verify_note = "no local test command; CI will verify"
 
@@ -757,6 +782,16 @@ def ci_fix_mode(api_key, model, pr_number, head_ref, base_ref):
         return True
 
     print(f"Validation failed with exit code {code}.")
+    if runner_unavailable(test_cmd, code, stdout, stderr):
+        print(f"==> Validation runner unavailable ('{test_cmd}' is not "
+              "installed in this environment); cannot reproduce locally — "
+              "exiting without changes.")
+        if pr_number and os.environ.get("TRIGGER_EVENT") in ("issue_comment", "workflow_dispatch"):
+            post_pr_comment(pr_number,
+                f"Autofix could not verify locally: `{test_cmd}` is not "
+                "available in the repair environment, so no local repair "
+                "was attempted. CI results on this PR are the source of truth.")
+        return True
     combined = (stdout + "\n" + stderr).strip()
     lines = combined.splitlines()
     error_snippet = "\n".join(lines[-120:]) if len(lines) > 120 else combined
@@ -960,11 +995,19 @@ def scheduled_fix_mode(api_key, model, repo, run_id, workflow_name, run_url,
     if test_cmd:
         print(f"==> Verifying with '{test_cmd}' in '{test_cwd}'")
         v_code, v_out, v_err = run_cmd(test_cmd, cwd=test_cwd)
-        if v_code != 0:
+        if v_code != 0 and runner_unavailable(test_cmd, v_code, v_out, v_err):
+            print(f"==> Validation runner unavailable ('{test_cmd}' is not "
+                  "installed in this environment); opening the PR "
+                  "unverified — CI will verify.")
+            verify_note = (f"⚠️ not verified locally — `{test_cmd}` is not "
+                           "available in the repair environment; CI on this "
+                           "PR will verify")
+        elif v_code != 0:
             print("Verification failed after applying fix. Rolling back; no PR opened.")
             run_cmd("git checkout -- .")
             return False
-        verify_note = f"`{test_cmd}` passed locally"
+        else:
+            verify_note = f"`{test_cmd}` passed locally"
     else:
         verify_note = "no local test command found; CI on the PR will verify"
 
