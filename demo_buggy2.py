@@ -1,4 +1,5 @@
 import sqlite3
+import os
 
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 
