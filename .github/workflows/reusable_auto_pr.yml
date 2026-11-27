@@ -1,0 +1,86 @@
+name: Reusable Auto-PR Creator
+
+# Central reusable workflow — lives in JWEB0689/pr-agent-settings
+# at .github/workflows/reusable_auto_pr.yml once deployed.
+# Modes: issue | failure  (see engine/auto_pr.py)
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        type: string
+        required: true
+      model:
+        type: string
+        default: "gemini-3.8-flash"
+      issue_number:
+        type: string
+        required: false
+      run_id:
+        type: string
+        required: false
+      workflow_name:
+        type: string
+        required: false
+      head_sha:
+        type: string
+        required: false
+      run_url:
+        type: string
+        required: false
+    secrets:
+      GEMINI_API_KEY:
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: read
+
+jobs:
+  auto-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve issue details
+        if: inputs.mode == 'issue'
+        id: issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/${{ github.repository }}/issues/${{ inputs.issue_number }}" > /tmp/issue.json
+          echo "title=$(jq -r .title /tmp/issue.json)" >> "$GITHUB_OUTPUT"
+          jq -r .body /tmp/issue.json > /tmp/issue_body.txt
+
+      - name: Fetch failure logs
+        if: inputs.mode == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh run view "${{ inputs.run_id }}" --repo "${{ github.repository }}" --log-failed > /tmp/failure.log 2>/dev/null || true
+          tail -c 12000 /tmp/failure.log > /tmp/failure_tail.log || true
+
+      - name: Checkout default branch / failed sha
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.head_sha || '' }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Auto-PR engine
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ inputs.model }}
+          MODE: ${{ inputs.mode }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          ISSUE_TITLE: ${{ steps.issue.outputs.title }}
+          RUN_ID: ${{ inputs.run_id }}
+          WORKFLOW_NAME: ${{ inputs.workflow_name }}
+          RUN_URL: ${{ inputs.run_url }}
+        run: |
+          if [ -f /tmp/issue_body.txt ]; then export ISSUE_BODY="$(cat /tmp/issue_body.txt)"; fi
+          if [ -f /tmp/failure_tail.log ]; then export FAILURE_LOGS="$(cat /tmp/failure_tail.log)"; fi
+          curl -fsSL https://raw.githubusercontent.com/JWEB0689/pr-agent-settings/main/scripts/auto_pr.py -o /tmp/auto_pr.py
+          python3 /tmp/auto_pr.py
