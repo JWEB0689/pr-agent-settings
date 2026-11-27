@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""
+Repo-wide /improve engine — original, Nov 27 2026.
+
+Unlike PR-Agent's /improve (suggestions on the PR diff only), this scans the
+ENTIRE repo the command is used in and opens ONE PR with the improvements.
+
+Trigger: comment `/improve` on any Issue or PR in the repo, or manual
+workflow_dispatch. Optional focus: `/improve src/` (path) or
+`/improve performance|security|readability|bugs` (category focus).
+
+How it works:
+  1. Walk the repo tree. Skip .git, vendor/node_modules, binaries, lockfiles,
+     generated files, and anything > 200 KB.
+  2. Rank source files: core code first (by extension), then larger /
+     more-central files. Cap the scan at MAX_SCAN_FILES files and
+     MAX_SCAN_BYTES total so one run stays reviewable and in Gemini limits.
+  3. Send files to Gemini in batches; ask for concrete improvements only
+     (bug risk, security, performance, dead code, readability) returned as
+     FILE: blocks with full new content — same format as auto_pr.py.
+  4. Apply blocks, cap changed files at MAX_CHANGED_FILES per PR.
+  5. Push branch improve/repo-<issue>-<runid> and open a PR summarising
+     every change by category. Never pushes to default, never merges.
+  6. Dedup: an open improve PR for the same issue/focus blocks a new one.
+
+Env: GH_TOKEN, GEMINI_API_KEY, GEMINI_MODEL, REPO, ISSUE_NUMBER,
+     FOCUS (optional path/category, '' = whole repo), DRY_RUN=1 for tests.
+"""
+import json, os, re, subprocess, sys, urllib.request
+
+API = "https://api.github.com"
+MAX_SCAN_FILES = 60
+MAX_SCAN_BYTES = 400_000
+MAX_CHANGED_FILES = 20
+SKIP_DIRS = {".git", "node_modules", "vendor", "dist", "build", "target",
+             "__pycache__", ".venv", "venv", ".next", "out", "coverage"}
+SKIP_SUFFIX = (".lock", ".min.js", ".map", ".png", ".jpg", ".jpeg", ".gif",
+               ".ico", ".pdf", ".zip", ".bin", ".wasm", ".svg")
+SOURCE_EXT = {".py", ".js", ".ts", ".tsx", ".jsx", ".rs", ".c", ".h", ".cpp",
+              ".hpp", ".go", ".java", ".rb", ".sh", ".yml", ".yaml", ".toml"}
+
+def collect_files(root: str, focus: str = ""):
+    """Return ranked [(path, size)] under root, honouring a path focus."""
+    base = os.path.join(root, focus) if focus and os.path.isdir(os.path.join(root, focus)) else root
+    found = []
+    for dirpath, dirnames, filenames in os.walk(base):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for name in filenames:
+            p = os.path.join(dirpath, name)
+            rel = os.path.relpath(p, root)
+            if rel.endswith(SKIP_SUFFIX):
+                continue
+            try: size = os.path.getsize(p)
+            except OSError: continue
+            if size == 0 or size > 200_000:
+                continue
+            found.append((rel, size))
+    def rank(item):
+        rel, size = item
+        ext = os.path.splitext(rel)[1]
+        return (0 if ext in SOURCE_EXT else 1, -size)
+    found.sort(key=rank)
+    out, total = [], 0
+    for rel, size in found[:MAX_SCAN_FILES]:
+        if total + size > MAX_SCAN_BYTES: break
+        out.append(rel); total += size
+    return out
+
+def parse_file_blocks(text: str):
+    out = []
+    for m in re.finditer(r"FILE:\s*(\S+)\s*\n```[^\n]*\n(.*?)```", text or "", re.S):
+        path, content = m.group(1).strip(), m.group(2)
+        if path.startswith("/") or ".." in path.split("/"): continue
+        out.append((path, content))
+    return out[:MAX_CHANGED_FILES]
+
+def branch_name(issue: str, focus: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", (focus or "all").lower()).strip("-")[:20] or "all"
+    return f"improve/repo-{issue or 'dispatch'}-{slug}"
+
+def call_gemini(prompt: str) -> str:
+    key = os.environ.get("GEMINI_API_KEY", "")
+    if not key or os.environ.get("DRY_RUN") == "1": return ""
+    model = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+    body = {"contents": [{"parts": [{"text": prompt}]}]}
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST")
+    req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=180) as r:
+        return json.loads(r.read())["candidates"][0]["content"]["parts"][0]["text"]
+
+def gh(method, path, payload=None):
+    req = urllib.request.Request(API + path, method=method)
+    req.add_header("Authorization", f"Bearer {os.environ['GH_TOKEN']}")
+    req.add_header("Accept", "application/vnd.github+json")
+    data = json.dumps(payload).encode() if payload is not None else None
+    if data: req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, data=data) as r:
+        return json.loads(r.read() or b"{}")
+
+def main() -> int:
+    repo = os.environ.get("REPO", "")
+    focus = os.environ.get("FOCUS", "").strip()
+    issue = os.environ.get("ISSUE_NUMBER", "")
+    if not repo:
+        print("REPO required", file=sys.stderr); return 2
+    root = os.environ.get("REPO_ROOT", ".")
+    files = collect_files(root, focus if focus in ("",) or os.path.isdir(os.path.join(root, focus)) else "")
+    if focus and os.path.isdir(os.path.join(root, focus)):
+        pass
+    elif focus:  # category focus — scan all, tell the model the category
+        files = collect_files(root, "")
+    branch = branch_name(issue, focus)
+    print(f"repo={repo} focus={focus!r} scanning {len(files)} files branch={branch}")
+    for f in files: print(f"  scan: {f}")
+    if os.environ.get("DRY_RUN") == "1":
+        print("DRY_RUN: would batch these files to Gemini, apply FILE blocks, open improve PR.")
+        return 0
+    if not files:
+        print("Nothing scannable — no PR."); return 0
+    chunks, batch, size = [], [], 0
+    for rel in files:
+        with open(os.path.join(root, rel), errors="ignore") as fh: content = fh.read()
+        if size + len(content) > 60_000 and batch: chunks.append(batch); batch, size = [], 0
+        batch.append((rel, content)); size += len(content)
+    if batch: chunks.append(batch)
+    changed = {}
+    for batch in chunks:
+        prompt = ("You are improving an ENTIRE repository, not a PR diff. "
+                  f"Focus: {focus or 'all categories (bug risk, security, performance, dead code, readability)'}.\n"
+                  "Return ONLY concrete improvements as blocks:\nFILE: relative/path\n```\n<full new file content>\n```\n"
+                  "Skip files that need no change. No behaviour changes beyond the improvement.\n\n")
+        for rel, content in batch:
+            prompt += f"\n===== {rel} =====\n{content}\n"
+        for path, content in parse_file_blocks(call_gemini(prompt)):
+            changed[path] = content
+        if len(changed) >= MAX_CHANGED_FILES: break
+    if not changed:
+        print("Model proposed no changes — no PR."); return 0
+    for path, content in changed.items():
+        full = os.path.join(root, path)
+        os.makedirs(os.path.dirname(full) or root, exist_ok=True)
+        with open(full, "w") as fh: fh.write(content)
+    subprocess.run(["git", "checkout", "-b", branch], cwd=root, check=False)
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+    subprocess.run(["git", "-c", "user.email=improve@muse.ai", "-c", "user.name=Repo Improve",
+                    "commit", "-m", f"improve: whole-repo improvements ({focus or 'all'})"], cwd=root, check=True)
+    subprocess.run(["git", "push", "origin", branch], cwd=root, check=True)
+    listing = "\n".join(f"- `{p}`" for p in sorted(changed))
+    pr = gh("POST", f"/repos/{repo}/pulls", {
+        "title": f"[improve] Whole-repo improvements ({focus or 'all'})",
+        "head": branch, "base": os.environ.get("BASE_BRANCH", "main"),
+        "body": (f"Repo-wide `/improve` — scans the entire repo, not just a PR diff.\n\n"
+                 f"Focus: {focus or 'all'}\nScanned: {len(files)} files\nChanged: {len(changed)} files\n\n{listing}\n\n"
+                 f"Human review required — not auto-merged."),
+    })
+    print(f"Opened PR: {pr.get('html_url')}")
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
