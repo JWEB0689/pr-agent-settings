@@ -1,0 +1,63 @@
+name: Reusable Repo-Wide Improve
+
+# Central reusable — lives in JWEB0689/pr-agent-settings
+# at .github/workflows/reusable_repo_improve.yml once deployed.
+# Scans the entire repo (engine: scripts/repo_improve.py), opens one PR.
+
+on:
+  workflow_call:
+    inputs:
+      issue_number:
+        type: string
+        required: false
+      focus:
+        type: string
+        required: false
+        default: ""
+      comment_body:
+        type: string
+        required: false
+        default: ""
+      model:
+        type: string
+        default: "gemini-3.8-flash"
+    secrets:
+      GEMINI_API_KEY:
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  improve:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Parse focus from comment
+        id: parse
+        run: |
+          FOCUS="${{ inputs.focus }}"
+          if [ -z "$FOCUS" ] && [ -n "${{ inputs.comment_body }}" ]; then
+            FOCUS=$(echo "${{ inputs.comment_body }}" | sed -n 's|^/improve[[:space:]]*||p' | head -1 | xargs)
+          fi
+          echo "focus=$FOCUS" >> "$GITHUB_OUTPUT"
+          echo "Focus: '${FOCUS:-whole repo}'"
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run repo-wide improve engine
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ inputs.model }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          FOCUS: ${{ steps.parse.outputs.focus }}
+          REPO_ROOT: .
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/JWEB0689/pr-agent-settings/main/scripts/repo_improve.py -o /tmp/repo_improve.py
+          python3 /tmp/repo_improve.py
