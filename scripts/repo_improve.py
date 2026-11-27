@@ -26,7 +26,7 @@ How it works:
 Env: GH_TOKEN, GEMINI_API_KEY, GEMINI_MODEL, REPO, ISSUE_NUMBER,
      FOCUS (optional path/category, '' = whole repo), DRY_RUN=1 for tests.
 """
-import json, os, re, subprocess, sys, urllib.request
+import json, os, re, subprocess, sys, time, urllib.error, urllib.request
 
 API = "https://api.github.com"
 MAX_SCAN_FILES = 60
@@ -78,16 +78,38 @@ def branch_name(issue: str, focus: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", (focus or "all").lower()).strip("-")[:20] or "all"
     return f"improve/repo-{issue or 'dispatch'}-{slug}"
 
+class GeminiError(Exception):
+    pass
+
 def call_gemini(prompt: str) -> str:
+    """One Gemini call with retries. Non-streaming generateContent returns
+    everything at once, so a slow model on a big prompt can exceed a plain
+    socket timeout (run 46084034282 died at exactly 180s, uncaught). Retry
+    timeouts / 429 / 5xx with backoff; raise GeminiError after the last try
+    so callers can skip a batch instead of crashing the whole run."""
     key = os.environ.get("GEMINI_API_KEY", "")
     if not key or os.environ.get("DRY_RUN") == "1": return ""
     model = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+    timeout = float(os.environ.get("GEMINI_TIMEOUT", "300"))
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
     body = {"contents": [{"parts": [{"text": prompt}]}]}
-    req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST")
-    req.add_header("Content-Type", "application/json")
-    with urllib.request.urlopen(req, timeout=180) as r:
-        return json.loads(r.read())["candidates"][0]["content"]["parts"][0]["text"]
+    last = None
+    for attempt in range(3):
+        req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST")
+        req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read())["candidates"][0]["content"]["parts"][0]["text"]
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code not in (429, 500, 502, 503, 504): raise GeminiError(f"Gemini HTTP {e.code}") from e
+        except (TimeoutError, urllib.error.URLError, OSError) as e:
+            last = e
+        if attempt < 2:
+            wait = 10 * (attempt + 1)
+            print(f"  Gemini attempt {attempt + 1} failed ({type(last).__name__}: {last}); retrying in {wait}s")
+            time.sleep(wait)
+    raise GeminiError(f"Gemini call failed after 3 attempts: {type(last).__name__}: {last}")
 
 def gh(method, path, payload=None):
     req = urllib.request.Request(API + path, method=method)
@@ -121,20 +143,36 @@ def main() -> int:
     chunks, batch, size = [], [], 0
     for rel in files:
         with open(os.path.join(root, rel), errors="ignore") as fh: content = fh.read()
-        if size + len(content) > 60_000 and batch: chunks.append(batch); batch, size = [], 0
+        if size + len(content) > 30_000 and batch: chunks.append(batch); batch, size = [], 0
         batch.append((rel, content)); size += len(content)
     if batch: chunks.append(batch)
     changed = {}
-    for batch in chunks:
+    failures = []
+    for i, batch in enumerate(chunks, 1):
         prompt = ("You are improving an ENTIRE repository, not a PR diff. "
                   f"Focus: {focus or 'all categories (bug risk, security, performance, dead code, readability)'}.\n"
                   "Return ONLY concrete improvements as blocks:\nFILE: relative/path\n```\n<full new file content>\n```\n"
                   "Skip files that need no change. No behaviour changes beyond the improvement.\n\n")
         for rel, content in batch:
             prompt += f"\n===== {rel} =====\n{content}\n"
-        for path, content in parse_file_blocks(call_gemini(prompt)):
+        try:
+            reply = call_gemini(prompt)
+        except GeminiError as e:
+            print(f"  batch {i}/{len(chunks)} failed: {e}")
+            failures.append(str(e)); continue
+        for path, content in parse_file_blocks(reply):
             changed[path] = content
         if len(changed) >= MAX_CHANGED_FILES: break
+    if failures and not changed:
+        msg = (f"Repo-wide `/improve` run failed: the model call did not complete "
+               f"({failures[0]}). No PR was opened. Re-run `/improve` to try again.")
+        print(msg)
+        if issue:
+            try: gh("POST", f"/repos/{repo}/issues/{issue}/comments", {"body": msg})
+            except Exception as e: print(f"  (could not post failure comment: {e})")
+        return 1
+    if failures:
+        print(f"  note: {len(failures)}/{len(chunks)} batches failed; proceeding with the rest.")
     if not changed:
         print("Model proposed no changes — no PR."); return 0
     for path, content in changed.items():
