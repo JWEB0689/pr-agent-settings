@@ -22,7 +22,7 @@ Env: GH_TOKEN, GEMINI_API_KEY, GEMINI_MODEL, REPO, MODE,
      ISSUE_NUMBER (issue mode), RUN_ID / WORKFLOW_NAME / RUN_URL / HEAD_SHA (failure mode),
      DRY_RUN=1 for local tests (no GitHub writes, no Gemini call).
 """
-import json, os, re, subprocess, sys, urllib.request, urllib.error
+import json, os, re, subprocess, sys, time, urllib.request, urllib.error
 
 API = "https://api.github.com"
 INFRA_PATTERNS = [
@@ -61,18 +61,37 @@ def open_pr_exists(repo: str, branch: str) -> bool:
     return len(prs) > 0
 
 def call_gemini(prompt: str) -> str:
-    """Return raw model text. Caller parses file blocks. No key / dry-run -> ''."""
+    """Return raw model text. Caller parses file blocks. No key / dry-run -> ''.
+    Retries timeouts / 429 / 5xx with backoff (a single 120s timeout crashed
+    runs outright); after the last attempt returns '' so the caller takes its
+    existing no-fix path instead of dying with a traceback."""
     key = os.environ.get("GEMINI_API_KEY", "")
     if not key or os.environ.get("DRY_RUN") == "1":
         return ""
     model = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+    timeout = float(os.environ.get("GEMINI_TIMEOUT", "300"))
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
     body = {"contents": [{"parts": [{"text": prompt}]}]}
-    req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST")
-    req.add_header("Content-Type", "application/json")
-    with urllib.request.urlopen(req, timeout=120) as r:
-        data = json.loads(r.read())
-    return data["candidates"][0]["content"]["parts"][0]["text"]
+    last = None
+    for attempt in range(3):
+        req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST")
+        req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                data = json.loads(r.read())
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code not in (429, 500, 502, 503, 504):
+                print(f"Gemini HTTP {e.code} — giving up"); return ""
+        except (TimeoutError, urllib.error.URLError, OSError) as e:
+            last = e
+        if attempt < 2:
+            wait = 10 * (attempt + 1)
+            print(f"Gemini attempt {attempt + 1} failed ({type(last).__name__}: {last}); retrying in {wait}s")
+            time.sleep(wait)
+    print(f"Gemini call failed after 3 attempts: {type(last).__name__}: {last}")
+    return ""
 
 def parse_file_blocks(text: str):
     """Model output format:  FILE: path\\n```\\n...\\n```  blocks."""
