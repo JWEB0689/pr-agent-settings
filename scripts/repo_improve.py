@@ -230,6 +230,18 @@ def gh(method, path, payload=None):
     with urllib.request.urlopen(req, data=data) as r:
         return json.loads(r.read() or b"{}")
 
+def default_base(repo: str) -> str:
+    """PR base branch: BASE_BRANCH env wins; otherwise the repo's actual
+    default branch from the API (hardcoding 'main' 422s on master-default
+    repos — DeNoiser, Nov 27 2026); 'main' only as a last resort."""
+    env = os.environ.get("BASE_BRANCH")
+    if env: return env
+    try:
+        info = gh("GET", f"/repos/{repo}")
+        if info and info.get("default_branch"): return info["default_branch"]
+    except Exception: pass
+    return "main"
+
 def push_branch(branch, cwd=None):
     """Push a bot-owned branch. Branch names are deterministic
     (improve/repo-<issue>-<focus>), so a stale branch from an earlier
@@ -371,7 +383,7 @@ def main() -> int:
                             + "\n".join(f"- `{p}`" for p in wf_skipped))
         pr = gh("POST", f"/repos/{repo}/pulls", {
             "title": f"[improve] Whole-repo improvements ({focus or 'all'})",
-            "head": branch, "base": os.environ.get("BASE_BRANCH", "main"),
+            "head": branch, "base": default_base(repo),
             "body": (f"Repo-wide `/improve` — scans the entire repo, not just a PR diff.\n\n"
                      f"Focus: {focus or 'all'}\nScanned: {len(files)} files\nChanged: {len(changed)} files\nModel: {LAST_MODEL_USED or 'unknown'}\n\n{listing}{skipped_note}\n\n"
                      f"Human review required — not auto-merged."),
