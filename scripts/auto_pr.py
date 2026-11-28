@@ -81,12 +81,13 @@ def call_gemini(prompt: str) -> str:
     if not key or os.environ.get("DRY_RUN") == "1":
         return ""
     timeout = float(os.environ.get("GEMINI_TIMEOUT", "300"))
+    attempts = int(os.environ.get("GEMINI_ATTEMPTS", "5"))
     body = {"contents": [{"parts": [{"text": prompt}]}]}
     failures = []
     for model in model_chain():
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
         last = None
-        for attempt in range(3):
+        for attempt in range(attempts):
             req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST")
             req.add_header("Content-Type", "application/json")
             try:
@@ -106,9 +107,9 @@ def call_gemini(prompt: str) -> str:
                     print(f"Gemini HTTP {e.code} on {model} — giving up"); return ""
             except (TimeoutError, urllib.error.URLError, OSError) as e:
                 last = e
-            if attempt < 2:
-                wait = 10 * (attempt + 1)
-                print(f"{model} attempt {attempt + 1} failed ({type(last).__name__}: {last}); retrying in {wait}s")
+            if attempt < attempts - 1:
+                wait = min(15 * (2 ** attempt), 120)
+                print(f"{model} attempt {attempt + 1} failed ({type(last).__name__}: {last}); retrying in {wait}s", flush=True)
                 time.sleep(wait)
         failures.append(f"{model}: {type(last).__name__}: {last}")
         print(f"{model} exhausted; trying next model in chain")
