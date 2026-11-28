@@ -636,7 +636,8 @@ def post_inline_suggestions(repo, pr_number, head_sha, findings, pr_files):
     gh_api(f"/repos/{repo}/pulls/{pr_number}/reviews", method="POST", payload=payload)
 
 
-REVIEW_PROMPT_SCHEMA = """You are Qodo / Gemini Muse, an elite AI code reviewer. Analyze the pull request below and return ONLY a valid JSON object matching this exact schema:
+REVIEW_PROMPT_SCHEMA = """You are Qodo / Gemini Muse, an elite AI code reviewer. Analyze the pull request below and return ONLY a valid JSON object matching this exact schema.
+Review like a lazy senior dev: do not flag pure style, formatting, or speculative "could be more generic" concerns. Prefer fixes that reuse what the codebase, standard library, or platform already provides — no new dependencies or abstractions. Each finding's fixed_code must be the smallest snippet that fixes the issue, never a whole function or file when a few lines suffice. Fewer, real findings beat many marginal ones.
 {
   "summary": {
     "headline": "Concise 1-line imperative summary of the PR (e.g. 'Restore ARM64 APK builds with Tailwind v3 compatibility')",
