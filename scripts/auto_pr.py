@@ -157,7 +157,10 @@ def main() -> int:
     prompt = (
         "You are a fix bot. Produce ONLY file blocks in this exact format for files that must change:\n"
         "FILE: relative/path\n```\n<full new file content>\n```\n"
-        "Keep changes minimal and scoped to this problem:\n\n" + source
+        "Keep changes minimal and scoped to this problem. Work like a lazy senior dev: fix the root "
+        "cause once, reuse what the codebase, standard library, or platform already provides, no new "
+        "dependencies or abstractions, deletion over addition. Never simplify away input validation, "
+        "error handling, security, or accessibility:\n\n" + source
     )
     files = parse_file_blocks(call_gemini(prompt))
     if not files:
