@@ -13,6 +13,10 @@ on:
       model:
         type: string
         default: "gemini-3.8-flash"
+      service_tier:
+        type: string
+        required: false
+        default: ""
       issue_number:
         type: string
         required: false
@@ -72,6 +76,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ inputs.model }}
+          GEMINI_SERVICE_TIER: ${{ inputs.service_tier }}
           MODE: ${{ inputs.mode }}
           REPO: ${{ github.repository }}
           ISSUE_NUMBER: ${{ inputs.issue_number }}
