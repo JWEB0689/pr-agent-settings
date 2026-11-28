@@ -60,37 +60,59 @@ def open_pr_exists(repo: str, branch: str) -> bool:
     prs = gh("GET", f"/repos/{repo}/pulls?state=open&head={repo.split('/')[0]}:{branch}")
     return len(prs) > 0
 
+DEFAULT_FALLBACKS = "gemini-2.5-flash,gemini-flash-lite-latest"
+LAST_MODEL_USED = ""
+
+def model_chain() -> list:
+    primary = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+    fallbacks = os.environ.get("GEMINI_FALLBACK_MODELS", DEFAULT_FALLBACKS)
+    chain = [primary] + [m.strip() for m in fallbacks.split(",") if m.strip()]
+    return list(dict.fromkeys(chain))
+
 def call_gemini(prompt: str) -> str:
     """Return raw model text. Caller parses file blocks. No key / dry-run -> ''.
-    Retries timeouts / 429 / 5xx with backoff (a single 120s timeout crashed
-    runs outright); after the last attempt returns '' so the caller takes its
-    existing no-fix path instead of dying with a traceback."""
+    Per-model retries (timeouts / 429 / 5xx, backoff), then falls back to the
+    next model in the chain — gemini-3.8-flash has been shedding load with
+    503s while other models stay healthy. A model the key can't use (404/400)
+    is skipped immediately; auth failure (401/403) aborts. Total failure
+    returns '' so the caller takes its existing no-fix path."""
+    global LAST_MODEL_USED
     key = os.environ.get("GEMINI_API_KEY", "")
     if not key or os.environ.get("DRY_RUN") == "1":
         return ""
-    model = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
     timeout = float(os.environ.get("GEMINI_TIMEOUT", "300"))
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
     body = {"contents": [{"parts": [{"text": prompt}]}]}
-    last = None
-    for attempt in range(3):
-        req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST")
-        req.add_header("Content-Type", "application/json")
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                data = json.loads(r.read())
-            return data["candidates"][0]["content"]["parts"][0]["text"]
-        except urllib.error.HTTPError as e:
-            last = e
-            if e.code not in (429, 500, 502, 503, 504):
-                print(f"Gemini HTTP {e.code} — giving up"); return ""
-        except (TimeoutError, urllib.error.URLError, OSError) as e:
-            last = e
-        if attempt < 2:
-            wait = 10 * (attempt + 1)
-            print(f"Gemini attempt {attempt + 1} failed ({type(last).__name__}: {last}); retrying in {wait}s")
-            time.sleep(wait)
-    print(f"Gemini call failed after 3 attempts: {type(last).__name__}: {last}")
+    failures = []
+    for model in model_chain():
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+        last = None
+        for attempt in range(3):
+            req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST")
+            req.add_header("Content-Type", "application/json")
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    data = json.loads(r.read())
+                if model != model_chain()[0]:
+                    print(f"Gemini answered via fallback model {model}")
+                LAST_MODEL_USED = model
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+            except urllib.error.HTTPError as e:
+                last = e
+                if e.code in (401, 403):
+                    print(f"Gemini HTTP {e.code} (auth) on {model} — chain aborted"); return ""
+                if e.code in (400, 404):
+                    print(f"{model} unusable (HTTP {e.code}); moving to next model"); break
+                if e.code not in (429, 500, 502, 503, 504):
+                    print(f"Gemini HTTP {e.code} on {model} — giving up"); return ""
+            except (TimeoutError, urllib.error.URLError, OSError) as e:
+                last = e
+            if attempt < 2:
+                wait = 10 * (attempt + 1)
+                print(f"{model} attempt {attempt + 1} failed ({type(last).__name__}: {last}); retrying in {wait}s")
+                time.sleep(wait)
+        failures.append(f"{model}: {type(last).__name__}: {last}")
+        print(f"{model} exhausted; trying next model in chain")
+    print("All models in fallback chain failed — " + " | ".join(failures))
     return ""
 
 def parse_file_blocks(text: str):
