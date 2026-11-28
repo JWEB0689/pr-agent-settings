@@ -293,6 +293,18 @@ def compress_log(text: str) -> str:
     flush()
     return "\n".join(out)
 
+def default_base(repo: str) -> str:
+    """PR base branch: BASE_BRANCH env wins; otherwise the repo's actual
+    default branch from the API (hardcoding 'main' 422s on master-default
+    repos — DeNoiser, Nov 27 2026); 'main' only as a last resort."""
+    env = os.environ.get("BASE_BRANCH")
+    if env: return env
+    try:
+        info = gh("GET", f"/repos/{repo}")
+        if info and info.get("default_branch"): return info["default_branch"]
+    except Exception: pass
+    return "main"
+
 def push_branch(branch, cwd=None):
     """Push a bot-owned branch. Branch names are deterministic
     (autofix/issue-<N>-..., autofix/run-...), so a stale branch from an
@@ -429,7 +441,7 @@ def main() -> int:
                             + "\n".join(f"- `{p}`" for p in wf_skipped))
         pr = gh("POST", f"/repos/{repo}/pulls", {
             "title": f"[auto-pr] {branch}", "head": branch,
-            "base": os.environ.get("BASE_BRANCH", "main"),
+            "base": default_base(repo),
             "body": f"Automated fix by Auto-PR Creator.\n\n{kind}{skipped_note}\n\nHuman review required — not auto-merged.",
         })
     except Exception as e:
