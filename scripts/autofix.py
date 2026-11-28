@@ -404,24 +404,26 @@ Respond ONLY with a JSON object conforming strictly to this schema:
 {
   "summary": "Short explanation of what was fixed",
   "files": [
-    {"path": "relative/path/to/file", "content": "Full, complete updated file contents"}
+    {"path": "relative/path/to/file", "replacements": [{"old": "exact original text, copied verbatim, occurring exactly once", "new": "replacement text"}]}
   ]
 }
+Prefer "replacements" for existing files — it is far cheaper than resending a whole file. Use "content" (full, complete updated file contents) only for new files or rewrites where a replacement would be longer. Work like a lazy senior dev: reuse what the codebase, standard library, or platform already provides; no new dependencies or abstractions; deletion over addition. Never simplify away input validation, error handling, security, or accessibility.
 Do not use placeholders or omit lines. If no finding warrants a code change, return {"summary": "no changes needed", "files": []}.
 """
 
 CI_SYSTEM_PROMPT = """You are an autonomous senior software engineer. The project's build/test check failed with the error below.
 1. Diagnose the exact root cause of the error.
-2. Provide the complete updated content for each file that needs to be fixed. Do not use placeholders or omit lines.
+2. For each file that needs fixing, give exact replacements (or full content only for new files / large rewrites). Do not use placeholders or omit lines.
 3. Keep changes minimal, surgical, and idiomatic.
 
 Respond ONLY with a JSON object conforming strictly to this schema:
 {
   "summary": "Short explanation of root cause and fix applied",
   "files": [
-    {"path": "relative/path/to/file", "content": "Full, complete updated file contents"}
+    {"path": "relative/path/to/file", "replacements": [{"old": "exact original text, copied verbatim, occurring exactly once", "new": "replacement text"}]}
   ]
 }
+Prefer "replacements" for existing files — it is far cheaper than resending a whole file. Use "content" (full, complete updated file contents) only for new files or rewrites where a replacement would be longer. Work like a lazy senior dev: reuse what the codebase, standard library, or platform already provides; no new dependencies or abstractions; deletion over addition. Never simplify away input validation, error handling, security, or accessibility.
 """
 
 
@@ -433,6 +435,26 @@ def apply_repair_files(repair_result, allowed_paths):
     repaired = []
     for item in repair_result["files"]:
         fpath, fcontent = item.get("path"), item.get("content")
+        reps = item.get("replacements")
+        if fpath and fcontent is None and reps:
+            # Cheap path: exact search/replace against the existing file.
+            # Every "old" must occur exactly once; any miss rejects the
+            # whole file rather than writing a half-applied fix.
+            try:
+                with open(fpath, encoding="utf-8") as fh: cur = fh.read()
+            except OSError:
+                print(f"Warning: replacements for unreadable file skipped: {fpath}")
+                continue
+            ok = True
+            for r in reps:
+                old_t, new_t = r.get("old"), r.get("new")
+                if old_t is None or new_t is None or cur.count(old_t) != 1:
+                    ok = False; break
+                cur = cur.replace(old_t, new_t)
+            if not ok:
+                print(f"Warning: replacement did not match exactly once, file skipped: {fpath}")
+                continue
+            item = dict(item); fcontent = cur
         if not fpath or fcontent is None:
             continue
         norm = safe_normpath(fpath)
@@ -831,7 +853,7 @@ def ci_fix_mode(api_key, model, pr_number, head_ref, base_ref):
 SCHEDULED_SYSTEM_PROMPT = """You are an autonomous senior software engineer. A scheduled CI workflow failed on the repository's default branch. The failure context is below.
 
 1. Diagnose the exact root cause of the failure.
-2. Provide the complete updated content for each file that needs to be fixed. Do not use placeholders or omit lines.
+2. For each file that needs fixing, give exact replacements (or full content only for new files / large rewrites). Do not use placeholders or omit lines.
 3. Keep changes minimal, surgical, and idiomatic. For dependency vulnerabilities, update the affected dependency constraints or manifests to fixed versions.
 4. Do NOT modify CI workflow files unless the failure is clearly caused by the workflow definition itself.
 
@@ -839,9 +861,10 @@ Respond ONLY with a JSON object conforming strictly to this schema:
 {
   "summary": "Short explanation of root cause and fix applied",
   "files": [
-    {"path": "relative/path/to/file", "content": "Full, complete updated file contents"}
+    {"path": "relative/path/to/file", "replacements": [{"old": "exact original text, copied verbatim, occurring exactly once", "new": "replacement text"}]}
   ]
 }
+Prefer "replacements" for existing files — it is far cheaper than resending a whole file. Use "content" (full, complete updated file contents) only for new files or rewrites where a replacement would be longer. Work like a lazy senior dev: reuse what the codebase, standard library, or platform already provides; no new dependencies or abstractions; deletion over addition. Never simplify away input validation, error handling, security, or accessibility.
 If the failure is infrastructure (no runners available, disk full, rate limits, network blips) or nothing actionable in code, return {"summary": "no code fix applicable", "files": []}.
 """
 
