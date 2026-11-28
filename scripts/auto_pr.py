@@ -162,33 +162,51 @@ def main() -> int:
     files = parse_file_blocks(call_gemini(prompt))
     if not files:
         print("No parseable fix from model — opening no PR."); return 0
+    # The Actions token can never push .github/workflows/* (no workflows
+    # permission — the push is rejected outright and used to kill the whole
+    # run, losing every other change). Partition those out and report them.
+    wf_skipped = [p for p, _ in files if p.startswith(".github/workflows/")]
+    files = [(p, c) for p, c in files if not p.startswith(".github/workflows/")]
+    if wf_skipped:
+        print(f"note: {len(wf_skipped)} workflow file(s) skipped (token cannot push them): {', '.join(wf_skipped)}")
+    if not files:
+        msg = (f"Auto-PR: the model proposed changes only to workflow files ({', '.join(wf_skipped)}), "
+               "which the Actions token cannot push (no `workflows` permission). No PR was opened — "
+               "those files need a token with workflows permission, or a manual edit.")
+        print(msg)
+        if mode == "issue" and os.environ.get("ISSUE_NUMBER"):
+            try: gh("POST", f"/repos/{repo}/issues/{os.environ['ISSUE_NUMBER']}/comments", {"body": msg})
+            except Exception as e: print(f"  (could not post comment: {e})")
+        return 0
     for path, content in files:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "w") as f: f.write(content)
     # Verification is handled by the caller workflow step in the full
     # deployment (missing runner = land with warning, real failure = rollback).
-    subprocess.run(["git", "checkout", "-b", branch], check=False)
-    subprocess.run(["git", "add", "-A"], check=True)
-    subprocess.run(["git", "-c", "user.email=autofix@muse.ai", "-c", "user.name=Auto-PR Creator",
-                    "commit", "-m", f"autofix: {branch}"], check=True)
     try:
+        subprocess.run(["git", "checkout", "-b", branch], check=False)
+        subprocess.run(["git", "add", "-A"], check=True)
+        subprocess.run(["git", "-c", "user.email=autofix@muse.ai", "-c", "user.name=Auto-PR Creator",
+                        "commit", "-m", f"autofix: {branch}"], check=True)
         subprocess.run(["git", "push", "origin", branch], check=True)
-    except subprocess.CalledProcessError as e:
-        # Report a rejected push cleanly instead of dying on a traceback
-        # (Agent run 46022506220 attempt 2). If the fix touches workflow
-        # files, name the likely cause: GitHub refuses GitHub App pushes
-        # to .github/workflows/ without `workflows` permission.
-        wf = [p for p, _ in files if p.startswith(".github/workflows/")]
-        hint = (f" The fix touches workflow file(s) {wf} — GitHub refuses GitHub App pushes "
-                "to .github/workflows/ without `workflows` permission.") if wf else ""
-        print(f"Push of {branch} rejected (git push exited {e.returncode}). No PR was opened.{hint}")
-        return 1
-    kind = f"Fixes #{os.environ.get('ISSUE_NUMBER')}" if mode == "issue" else f"Fixes failed run {os.environ.get('RUN_URL','')}"
-    pr = gh("POST", f"/repos/{repo}/pulls", {
-        "title": f"[auto-pr] {branch}", "head": branch,
-        "base": os.environ.get("BASE_BRANCH", "main"),
-        "body": f"Automated fix by Auto-PR Creator.\n\n{kind}\n\nHuman review required — not auto-merged.",
-    })
+        kind = f"Fixes #{os.environ.get('ISSUE_NUMBER')}" if mode == "issue" else f"Fixes failed run {os.environ.get('RUN_URL','')}"
+        skipped_note = ""
+        if wf_skipped:
+            skipped_note = ("\n\nSkipped (Actions token cannot push workflow files):\n"
+                            + "\n".join(f"- `{p}`" for p in wf_skipped))
+        pr = gh("POST", f"/repos/{repo}/pulls", {
+            "title": f"[auto-pr] {branch}", "head": branch,
+            "base": os.environ.get("BASE_BRANCH", "main"),
+            "body": f"Automated fix by Auto-PR Creator.\n\n{kind}{skipped_note}\n\nHuman review required — not auto-merged.",
+        })
+    except Exception as e:
+        # Push/PR failures must not die as a traceback.
+        msg = f"Auto-PR generated a fix but could not publish it: {type(e).__name__}: {e}. No PR was opened."
+        print(msg)
+        if mode == "issue" and os.environ.get("ISSUE_NUMBER"):
+            try: gh("POST", f"/repos/{repo}/issues/{os.environ['ISSUE_NUMBER']}/comments", {"body": msg})
+            except Exception as ce: print(f"  (could not post comment: {ce})")
+        return 0
     print(f"Opened PR: {pr.get('html_url')}")
     return 0
 
