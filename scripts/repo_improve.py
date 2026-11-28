@@ -81,35 +81,64 @@ def branch_name(issue: str, focus: str) -> str:
 class GeminiError(Exception):
     pass
 
-def call_gemini(prompt: str) -> str:
-    """One Gemini call with retries. Non-streaming generateContent returns
-    everything at once, so a slow model on a big prompt can exceed a plain
-    socket timeout (run 46084034282 died at exactly 180s, uncaught). Retry
-    timeouts / 429 / 5xx with backoff; raise GeminiError after the last try
-    so callers can skip a batch instead of crashing the whole run."""
-    key = os.environ.get("GEMINI_API_KEY", "")
-    if not key or os.environ.get("DRY_RUN") == "1": return ""
-    model = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
-    timeout = float(os.environ.get("GEMINI_TIMEOUT", "300"))
+# Fallback chain: primary model first, then these (GEMINI_FALLBACK_MODELS,
+# comma-separated, overrides). gemini-3.8-flash has been shedding load with
+# 503s since Nov 19 2026 while other models stay healthy, so a single-model
+# engine dies with the model. A model the key can't use (404/400) is skipped
+# immediately; an auth failure (401/403) aborts the chain — no model will work.
+DEFAULT_FALLBACKS = "gemini-2.5-flash,gemini-flash-lite-latest"
+LAST_MODEL_USED = ""
+
+def model_chain() -> list:
+    primary = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+    fallbacks = os.environ.get("GEMINI_FALLBACK_MODELS", DEFAULT_FALLBACKS)
+    chain = [primary] + [m.strip() for m in fallbacks.split(",") if m.strip()]
+    return list(dict.fromkeys(chain))
+
+def _call_once(model: str, prompt: str, key: str, timeout: float) -> str:
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
     body = {"contents": [{"parts": [{"text": prompt}]}]}
-    last = None
-    for attempt in range(3):
-        req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST")
-        req.add_header("Content-Type", "application/json")
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                return json.loads(r.read())["candidates"][0]["content"]["parts"][0]["text"]
-        except urllib.error.HTTPError as e:
-            last = e
-            if e.code not in (429, 500, 502, 503, 504): raise GeminiError(f"Gemini HTTP {e.code}") from e
-        except (TimeoutError, urllib.error.URLError, OSError) as e:
-            last = e
-        if attempt < 2:
-            wait = 10 * (attempt + 1)
-            print(f"  Gemini attempt {attempt + 1} failed ({type(last).__name__}: {last}); retrying in {wait}s")
-            time.sleep(wait)
-    raise GeminiError(f"Gemini call failed after 3 attempts: {type(last).__name__}: {last}")
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST")
+    req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())["candidates"][0]["content"]["parts"][0]["text"]
+
+def call_gemini(prompt: str) -> str:
+    """Gemini call with per-model retries, then fallback to the next model
+    in the chain. Raises GeminiError only when every model is exhausted, so
+    callers can skip a batch instead of crashing the whole run."""
+    global LAST_MODEL_USED
+    key = os.environ.get("GEMINI_API_KEY", "")
+    if not key or os.environ.get("DRY_RUN") == "1": return ""
+    timeout = float(os.environ.get("GEMINI_TIMEOUT", "300"))
+    failures = []
+    for model in model_chain():
+        last = None
+        for attempt in range(3):
+            try:
+                text = _call_once(model, prompt, key, timeout)
+                if model != model_chain()[0]:
+                    print(f"  Gemini answered via fallback model {model}")
+                LAST_MODEL_USED = model
+                return text
+            except urllib.error.HTTPError as e:
+                last = e
+                if e.code in (401, 403):
+                    raise GeminiError(f"Gemini HTTP {e.code} (auth) on {model} — chain aborted") from e
+                if e.code in (400, 404):
+                    print(f"  {model} unusable (HTTP {e.code}); moving to next model")
+                    break
+                if e.code not in (429, 500, 502, 503, 504):
+                    raise GeminiError(f"Gemini HTTP {e.code} on {model}") from e
+            except (TimeoutError, urllib.error.URLError, OSError) as e:
+                last = e
+            if attempt < 2:
+                wait = 10 * (attempt + 1)
+                print(f"  {model} attempt {attempt + 1} failed ({type(last).__name__}: {last}); retrying in {wait}s")
+                time.sleep(wait)
+        failures.append(f"{model}: {type(last).__name__}: {last}")
+        print(f"  {model} exhausted; trying next model in chain")
+    raise GeminiError("All models in fallback chain failed — " + " | ".join(failures))
 
 def gh(method, path, payload=None):
     req = urllib.request.Request(API + path, method=method)
@@ -189,7 +218,7 @@ def main() -> int:
         "title": f"[improve] Whole-repo improvements ({focus or 'all'})",
         "head": branch, "base": os.environ.get("BASE_BRANCH", "main"),
         "body": (f"Repo-wide `/improve` — scans the entire repo, not just a PR diff.\n\n"
-                 f"Focus: {focus or 'all'}\nScanned: {len(files)} files\nChanged: {len(changed)} files\n\n{listing}\n\n"
+                 f"Focus: {focus or 'all'}\nScanned: {len(files)} files\nChanged: {len(changed)} files\nModel: {LAST_MODEL_USED or 'unknown'}\n\n{listing}\n\n"
                  f"Human review required — not auto-merged."),
     })
     print(f"Opened PR: {pr.get('html_url')}")
