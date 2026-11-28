@@ -230,6 +230,24 @@ def gh(method, path, payload=None):
     with urllib.request.urlopen(req, data=data) as r:
         return json.loads(r.read() or b"{}")
 
+def push_branch(branch, cwd=None):
+    """Push a bot-owned branch. Branch names are deterministic
+    (improve/repo-<issue>-<focus>), so a stale branch from an earlier
+    attempt makes a plain push non-fast-forward and kills the run.
+    Retry once with --force-with-lease pinned to the remote sha just
+    observed — a human push racing us still blocks the overwrite."""
+    kw = {"cwd": cwd} if cwd else {}
+    try:
+        subprocess.run(["git", "push", "origin", branch], check=True, **kw); return
+    except subprocess.CalledProcessError:
+        out = subprocess.run(["git", "ls-remote", "origin", branch],
+                             capture_output=True, text=True, **kw)
+        sha = out.stdout.split()[0] if out.stdout.strip() else ""
+        if not sha: raise
+        print(f"  remote branch {branch} already exists (stale attempt) — force-with-lease push")
+        subprocess.run(["git", "push", f"--force-with-lease={branch}:{sha}", "origin", branch],
+                       check=True, **kw)
+
 def main() -> int:
     try: sys.stdout.reconfigure(line_buffering=True)
     except Exception: pass
@@ -345,7 +363,7 @@ def main() -> int:
         subprocess.run(["git", "add", "-A"], cwd=root, check=True)
         subprocess.run(["git", "-c", "user.email=improve@muse.ai", "-c", "user.name=Repo Improve",
                         "commit", "-m", f"improve: whole-repo improvements ({focus or 'all'})"], cwd=root, check=True)
-        subprocess.run(["git", "push", "origin", branch], cwd=root, check=True)
+        push_branch(branch, cwd=root)
         listing = "\n".join(f"- `{p}`" for p in sorted(changed))
         skipped_note = ""
         if wf_skipped:
