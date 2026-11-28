@@ -126,6 +126,83 @@ def parse_file_blocks(text: str):
         out.append((path, content))
     return out
 
+CONTEXT_EXTS = (".py", ".js", ".ts", ".tsx", ".jsx", ".rs", ".c", ".h", ".cpp",
+                ".go", ".java", ".rb", ".sh", ".yml", ".yaml", ".toml", ".json",
+                ".txt", ".md", ".cfg", ".ini")
+MAX_CONTEXT_FILES = 8
+MAX_CONTEXT_CHARS = 30_000
+
+def extract_paths(text: str):
+    """Path-like tokens from logs/issue text: quoted or bare, with optional
+    :line suffixes and ./ or /workspace/ prefixes stripped by the caller."""
+    out = []
+    pat = re.compile(r"[\"']?((?:[\w.\-]+/)+[\w.\-]+\.[A-Za-z0-9]{1,5}|[\w.\-]+\.[A-Za-z0-9]{1,5})(?::\d+(?::\d+)?)?[\"']?")
+    for m in pat.finditer(text or ""):
+        p = m.group(1)
+        if p.endswith(CONTEXT_EXTS) and p not in out:
+            out.append(p)
+    return out
+
+def _norm_candidate(p: str):
+    """Map a log path to a repo-relative path that exists, or None."""
+    p = p.strip().lstrip("./")
+    for marker in ("/workspace/", "/repo/", "repo/"):
+        if marker in p: p = p.split(marker, 1)[1]
+    if p.startswith("/") or ".." in p.split("/"): return None
+    if os.path.isfile(p): return p
+    # logs often carry runner paths; try suffix matches against the tree
+    parts = p.split("/")
+    for i in range(1, len(parts)):
+        cand = "/".join(parts[i:])
+        if os.path.isfile(cand): return cand
+    return None
+
+def gather_context(source_text: str, extra_paths=()):
+    """Grounding (Nov 27 2026): the files this failure/issue actually
+    implicates — paths named in the logs, plus (failure mode) the files
+    changed by the failed commit and dependency manifests. Returns
+    {relpath: content} capped so the prompt stays cheap."""
+    candidates = []
+    for p in list(extra_paths) + extract_paths(source_text):
+        rel = _norm_candidate(p)
+        if rel and rel not in candidates: candidates.append(rel)
+    ctx, total = {}, 0
+    for rel in candidates[:MAX_CONTEXT_FILES]:
+        try:
+            with open(rel, errors="ignore") as fh: content = fh.read()
+        except OSError: continue
+        content = content[:8000]
+        if total + len(content) > MAX_CONTEXT_CHARS: break
+        ctx[rel] = content; total += len(content)
+    return ctx
+
+def failed_commit_files():
+    """Files changed by HEAD (the failed commit in failure mode)."""
+    try:
+        out = subprocess.run(["git", "show", "--pretty=", "--name-only", "HEAD"],
+                             capture_output=True, text=True, timeout=15)
+        return [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+    except Exception:
+        return []
+
+def parse_patch_blocks(text: str):
+    """PATCH: path blocks with <<<<<<< SEARCH / ======= / >>>>>>> REPLACE."""
+    out, order = {}, []
+    pat = re.compile(r"PATCH:\s*(\S+)\s*\n<<<<<<< SEARCH\n(.*?)\n=======\n(.*?)\n>>>>>>> REPLACE", re.S)
+    for m in pat.finditer(text or ""):
+        path = m.group(1).strip()
+        if path.startswith("/") or ".." in path.split("/"): continue
+        if path not in out: out[path] = []; order.append(path)
+        out[path].append((m.group(2), m.group(3)))
+    return [(p, out[p]) for p in order]
+
+def apply_patch(content: str, pairs):
+    """Every SEARCH must match exactly once; returns new content or None."""
+    for old, new in pairs:
+        if content.count(old) != 1: return None
+        content = content.replace(old, new)
+    return content
+
 def main() -> int:
     mode = os.environ.get("MODE", "")
     repo = os.environ.get("REPO", "")
@@ -154,15 +231,56 @@ def main() -> int:
         print(f"Source preview: {source[:300]}")
         return 0
 
-    prompt = (
-        "You are a fix bot. Produce ONLY file blocks in this exact format for files that must change:\n"
-        "FILE: relative/path\n```\n<full new file content>\n```\n"
-        "Keep changes minimal and scoped to this problem. Work like a lazy senior dev: fix the root "
-        "cause once, reuse what the codebase, standard library, or platform already provides, no new "
-        "dependencies or abstractions, deletion over addition. Never simplify away input validation, "
-        "error handling, security, or accessibility:\n\n" + source
-    )
-    files = parse_file_blocks(call_gemini(prompt))
+    # Grounding: give the model the actual files implicated by the
+    # failure/issue instead of asking it to invent whole files from the
+    # log tail alone (the pre-grounding failure mode could not produce a
+    # reliable fix — its one real attempt generated an unrelated new
+    # workflow file). With contents in the prompt, fixes come back as
+    # cheap exact patches instead of full-file rewrites.
+    extra = []
+    if mode == "failure":
+        extra += failed_commit_files()
+        extra += [m for m in ("package.json", "pyproject.toml", "requirements.txt",
+                              "Cargo.toml", "go.mod", "Gemfile") if os.path.isfile(m)]
+    ctx = gather_context(source, extra)
+    ponytail = ("Work like a lazy senior dev: fix the root cause once, reuse what the codebase, "
+                "standard library, or platform already provides, no new dependencies or abstractions, "
+                "deletion over addition. Never simplify away input validation, error handling, "
+                "security, or accessibility. ")
+    if ctx:
+        print(f"Grounded in {len(ctx)} implicated file(s): {', '.join(ctx)}")
+        contents_txt = "".join(f"\n===== {p} =====\n{c}\n" for p, c in ctx.items())
+        prompt = (
+            "You are a fix bot. The problem is below, followed by the EXACT current contents of the "
+            "files it implicates. Produce ONLY patch blocks in this exact format:\n"
+            "PATCH: relative/path\n<<<<<<< SEARCH\n<exact original lines, copied verbatim>\n=======\n"
+            "<replacement lines>\n>>>>>>> REPLACE\n"
+            "One PATCH block per edit. Only for a brand-new file use:\n"
+            "FILE: relative/path\n```\n<full new file content>\n```\n"
+            "Keep changes minimal and scoped to this problem. " + ponytail + "\n\n"
+            + source + "\n\n--- FILE CONTENTS ---" + contents_txt
+        )
+    else:
+        prompt = (
+            "You are a fix bot. Produce ONLY file blocks in this exact format for files that must change:\n"
+            "FILE: relative/path\n```\n<full new file content>\n```\n"
+            "Keep changes minimal and scoped to this problem. " + ponytail + "\n\n" + source
+        )
+    reply = call_gemini(prompt)
+    files = []
+    for path, pairs in parse_patch_blocks(reply):
+        try:
+            with open(path, errors="ignore") as fh: base = fh.read()
+        except OSError:
+            continue
+        applied = apply_patch(base, pairs)
+        if applied is None:
+            print(f"  patch for {path} did not apply cleanly — skipped")
+            continue
+        if applied != base: files.append((path, applied))
+    patched = {p for p, _ in files}
+    for path, content in parse_file_blocks(reply):
+        if path not in patched: files.append((path, content))
     if not files:
         print("No parseable fix from model — opening no PR."); return 0
     # The Actions token can never push .github/workflows/* (no workflows
