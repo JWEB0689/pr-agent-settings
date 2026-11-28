@@ -22,7 +22,7 @@ Env: GH_TOKEN, GEMINI_API_KEY, GEMINI_MODEL, REPO, MODE,
      ISSUE_NUMBER (issue mode), RUN_ID / WORKFLOW_NAME / RUN_URL / HEAD_SHA (failure mode),
      DRY_RUN=1 for local tests (no GitHub writes, no Gemini call).
 """
-import json, os, re, subprocess, sys, time, urllib.request, urllib.error
+import ast, json, os, re, subprocess, sys, time, urllib.request, urllib.error
 
 API = "https://api.github.com"
 INFRA_PATTERNS = [
@@ -63,13 +63,13 @@ def open_pr_exists(repo: str, branch: str) -> bool:
 DEFAULT_FALLBACKS = "gemini-2.5-flash,gemini-flash-lite-latest"
 LAST_MODEL_USED = ""
 
-def model_chain() -> list:
-    primary = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+def model_chain(first_model: str | None = None) -> list:
+    primary = first_model or os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
     fallbacks = os.environ.get("GEMINI_FALLBACK_MODELS", DEFAULT_FALLBACKS)
     chain = [primary] + [m.strip() for m in fallbacks.split(",") if m.strip()]
     return list(dict.fromkeys(chain))
 
-def call_gemini(prompt: str) -> str:
+def call_gemini(prompt: str, first_model: str | None = None) -> str:
     """Return raw model text. Caller parses file blocks. No key / dry-run -> ''.
     Per-model retries (timeouts / 429 / 5xx, backoff), then falls back to the
     next model in the chain — gemini-3.8-flash has been shedding load with
@@ -87,7 +87,7 @@ def call_gemini(prompt: str) -> str:
     if os.environ.get("GEMINI_SERVICE_TIER"):
         body["serviceTier"] = os.environ["GEMINI_SERVICE_TIER"]
     failures = []
-    for model in model_chain():
+    for model in model_chain(first_model):
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
         last = None
         for attempt in range(attempts):
@@ -96,7 +96,7 @@ def call_gemini(prompt: str) -> str:
             try:
                 with urllib.request.urlopen(req, timeout=timeout) as r:
                     data = json.loads(r.read())
-                if model != model_chain()[0]:
+                if model != model_chain(first_model)[0]:
                     print(f"Gemini answered via fallback model {model}")
                 LAST_MODEL_USED = model
                 return data["candidates"][0]["content"]["parts"][0]["text"]
@@ -178,6 +178,72 @@ def gather_context(source_text: str, extra_paths=()):
         if total + len(content) > MAX_CONTEXT_CHARS: break
         ctx[rel] = content; total += len(content)
     return ctx
+
+def skeleton(rel: str, content: str) -> str:
+    """Compact per-file skeleton for triage: imports + definition lines.
+    Same builder as repo_improve's — local and free."""
+    lines = content.splitlines()
+    picked = []
+    if rel.endswith(".py"):
+        try:
+            tree = ast.parse(content)
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.Import, ast.ImportFrom)):
+                    picked.append(lines[node.lineno - 1].strip())
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    picked.append(lines[node.lineno - 1].strip())
+        except SyntaxError:
+            picked = []
+    if not picked:
+        pat = re.compile(r"^\s*(import |from |#include|fn |pub fn |func |function |class |def |export |const \w+ = \(|type \w+|interface )")
+        picked = [ln.strip() for ln in lines if pat.match(ln)]
+    head = f"{rel} ({len(lines)} lines)"
+    body = "\n".join(picked[:40])
+    return (head + "\n" + body)[:1200]
+
+_TRIAGE_SKIP_DIRS = {".git", "node_modules", "vendor", "dist", "build", "target",
+                     "__pycache__", ".venv", "venv", ".next", "out", "coverage"}
+
+def triage_context(source_text: str):
+    """Grounding fallback for when nothing is named in the issue/logs:
+    skeleton-scan the repo, let a cheap model pick the files this problem
+    most likely touches, and ground on their real contents. Returns {}
+    when triage finds nothing (caller then uses the blind prompt)."""
+    files = []
+    for dirpath, dirnames, filenames in os.walk("."):
+        dirnames[:] = [d for d in dirnames if d not in _TRIAGE_SKIP_DIRS]
+        for name in filenames:
+            rel = os.path.relpath(os.path.join(dirpath, name), ".")
+            if not rel.endswith(CONTEXT_EXTS): continue
+            try: size = os.path.getsize(rel)
+            except OSError: continue
+            if 0 < size <= 200_000: files.append(rel)
+    files.sort()
+    if not files: return {}
+    skels, total = [], 0
+    for rel in files[:80]:
+        try:
+            with open(rel, errors="ignore") as fh: content = fh.read()
+        except OSError: continue
+        s = skeleton(rel, content)
+        if total + len(s) > 60_000: break
+        skels.append(s); total += len(s)
+    if not skels: return {}
+    prompt = ("A code problem is described below. Below the problem are SKELETONS "
+              "(imports + signatures) of the repository's files. Pick the files MOST "
+              "likely to contain the cause or the fix. Reply with ONLY one picked path "
+              f"per line, at most {MAX_CONTEXT_FILES} paths, no explanations.\n\n"
+              "--- PROBLEM ---\n" + source_text[:6000] + "\n\n--- SKELETONS ---\n" + "\n\n".join(skels))
+    reply = call_gemini(prompt, first_model=os.environ.get("GEMINI_TRIAGE_MODEL", "gemini-2.5-flash"))
+    if not reply: return {}
+    picked = []
+    for ln in reply.splitlines():
+        cand = ln.strip().strip("`*- ")
+        rel = _norm_candidate(cand)
+        if rel and rel not in picked: picked.append(rel)
+    if not picked: return {}
+    print(f"  triage picked {len(picked)} file(s) for grounding: {', '.join(picked)}")
+    return gather_context("", extra_paths=picked)
 
 def failed_commit_files():
     """Files changed by HEAD (the failed commit in failure mode)."""
@@ -267,6 +333,10 @@ def main() -> int:
         extra += [m for m in ("package.json", "pyproject.toml", "requirements.txt",
                               "Cargo.toml", "go.mod", "Gemfile") if os.path.isfile(m)]
     ctx = gather_context(source, extra)
+    if not ctx:
+        # Nothing named in the issue/logs — skeleton-triage the repo so the
+        # fix prompt is still grounded in real files instead of blind.
+        ctx = triage_context(source)
     ponytail = ("Work like a lazy senior dev: fix the root cause once, reuse what the codebase, "
                 "standard library, or platform already provides, no new dependencies or abstractions, "
                 "deletion over addition. Never simplify away input validation, error handling, "
