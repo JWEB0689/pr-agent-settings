@@ -163,7 +163,10 @@ def model_chain() -> list:
 
 def _call_once(model: str, prompt: str, key: str, timeout: float) -> str:
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
-    body = {"contents": [{"parts": [{"text": prompt}]}]}
+    body = {"contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"maxOutputTokens": int(os.environ.get("GEMINI_MAX_OUTPUT", "16384"))}}
+    if os.environ.get("GEMINI_SERVICE_TIER"):
+        body["serviceTier"] = os.environ["GEMINI_SERVICE_TIER"]
     req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST")
     req.add_header("Content-Type", "application/json")
     with urllib.request.urlopen(req, timeout=timeout) as r:
