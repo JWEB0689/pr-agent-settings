@@ -171,7 +171,18 @@ def main() -> int:
     subprocess.run(["git", "add", "-A"], check=True)
     subprocess.run(["git", "-c", "user.email=autofix@muse.ai", "-c", "user.name=Auto-PR Creator",
                     "commit", "-m", f"autofix: {branch}"], check=True)
-    subprocess.run(["git", "push", "origin", branch], check=True)
+    try:
+        subprocess.run(["git", "push", "origin", branch], check=True)
+    except subprocess.CalledProcessError as e:
+        # Report a rejected push cleanly instead of dying on a traceback
+        # (Agent run 46022506220 attempt 2). If the fix touches workflow
+        # files, name the likely cause: GitHub refuses GitHub App pushes
+        # to .github/workflows/ without `workflows` permission.
+        wf = [p for p, _ in files if p.startswith(".github/workflows/")]
+        hint = (f" The fix touches workflow file(s) {wf} — GitHub refuses GitHub App pushes "
+                "to .github/workflows/ without `workflows` permission.") if wf else ""
+        print(f"Push of {branch} rejected (git push exited {e.returncode}). No PR was opened.{hint}")
+        return 1
     kind = f"Fixes #{os.environ.get('ISSUE_NUMBER')}" if mode == "issue" else f"Fixes failed run {os.environ.get('RUN_URL','')}"
     pr = gh("POST", f"/repos/{repo}/pulls", {
         "title": f"[auto-pr] {branch}", "head": branch,
