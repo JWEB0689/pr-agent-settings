@@ -15,9 +15,13 @@ How it works:
   2. Rank source files: core code first (by extension), then larger /
      more-central files. Cap the scan at MAX_SCAN_FILES files and
      MAX_SCAN_BYTES total so one run stays reviewable and in Gemini limits.
-  3. Send files to Gemini in batches; ask for concrete improvements only
-     (bug risk, security, performance, dead code, readability) returned as
-     FILE: blocks with full new content — same format as auto_pr.py.
+  3. Two-stage, token-cut (Nov 27 2026): (a) TRIAGE — send a locally built
+     skeleton of every file (imports + signatures only, ~10-20% of full
+     size) to a cheap model and ask ONLY which files are worth improving;
+     (b) DEEP — send full content ONLY for the picked files, ask for
+     concrete improvements as PATCH: search/replace blocks (not full
+     files), with FILE: full-content blocks still accepted as fallback.
+     Skipped when a path focus is given or the repo is small (<=12 files).
   4. Apply blocks, cap changed files at MAX_CHANGED_FILES per PR.
   5. Push branch improve/repo-<issue>-<runid> and open a PR summarising
      every change by category. Never pushes to default, never merges.
@@ -26,7 +30,7 @@ How it works:
 Env: GH_TOKEN, GEMINI_API_KEY, GEMINI_MODEL, REPO, ISSUE_NUMBER,
      FOCUS (optional path/category, '' = whole repo), DRY_RUN=1 for tests.
 """
-import json, os, re, subprocess, sys, time, urllib.error, urllib.request
+import ast, json, os, re, subprocess, sys, time, urllib.error, urllib.request
 
 API = "https://api.github.com"
 MAX_SCAN_FILES = 60
@@ -74,6 +78,68 @@ def parse_file_blocks(text: str):
         out.append((path, content))
     return out[:MAX_CHANGED_FILES]
 
+def skeleton(rel: str, content: str) -> str:
+    """Compact per-file skeleton for triage: imports + definition lines.
+    Local and free — this is what lets triage scan the whole repo for a
+    fraction of the tokens of sending full file contents."""
+    lines = content.splitlines()
+    picked = []
+    if rel.endswith(".py"):
+        try:
+            tree = ast.parse(content)
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.Import, ast.ImportFrom)):
+                    picked.append(lines[node.lineno - 1].strip())
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    picked.append(lines[node.lineno - 1].strip())
+        except SyntaxError:
+            picked = []
+    if not picked:
+        pat = re.compile(r"^\s*(import |from |#include|fn |pub fn |func |function |class |def |export |const \w+ = \(|type \w+|interface )")
+        picked = [ln.strip() for ln in lines if pat.match(ln)]
+    head = f"{rel} ({len(lines)} lines)"
+    body = "\n".join(picked[:40])
+    return (head + "\n" + body)[:1200]
+
+def parse_patch_blocks(text: str):
+    """PATCH: path blocks with <<<<<<< SEARCH / ======= / >>>>>>> REPLACE
+    sections. Returns [(path, [(search, replace), ...]), ...]."""
+    out = {}
+    order = []
+    pat = re.compile(r"PATCH:\s*(\S+)\s*\n<<<<<<< SEARCH\n(.*?)\n=======\n(.*?)\n>>>>>>> REPLACE", re.S)
+    for m in pat.finditer(text or ""):
+        path = m.group(1).strip()
+        if path.startswith("/") or ".." in path.split("/"): continue
+        if path not in out: out[path] = []; order.append(path)
+        out[path].append((m.group(2), m.group(3)))
+    return [(p, out[p]) for p in order[:MAX_CHANGED_FILES]]
+
+def apply_patch(content: str, pairs) -> str | None:
+    """Apply search/replace pairs; every SEARCH must match exactly once.
+    Returns the new content, or None if any pair fails (file skipped)."""
+    for old, new in pairs:
+        if content.count(old) != 1: return None
+        content = content.replace(old, new)
+    return content
+
+def triage_pick(files, contents, focus: str):
+    """Stage 1: skeleton-scan ALL files, model picks the ones worth a deep
+    look. Returns a subset of files, or None to fall back to all files."""
+    skels = "\n\n".join(skeleton(rel, contents[rel]) for rel in files)
+    prompt = ("You are triaging a repository for a code-improvement pass. "
+              f"Focus: {focus or 'all categories (bug risk, security, performance, dead code, readability)'}.\n"
+              "Below are SKELETONS (imports + signatures) of every file. Pick the files MOST likely to "
+              "contain a concrete improvement worth making. Reply with ONLY one picked path per line, "
+              f"at most {MAX_CHANGED_FILES} paths, no explanations.\n\n" + skels)
+    try:
+        reply = call_gemini(prompt, first_model=os.environ.get("GEMINI_TRIAGE_MODEL", "gemini-2.5-flash"))
+    except GeminiError as e:
+        print(f"  triage failed ({e}); falling back to full scan")
+        return None
+    picked = [rel for rel in files if any(rel == ln.strip().strip('`*- ') or rel in ln for ln in reply.splitlines())]
+    print(f"  triage picked {len(picked)}/{len(files)} files for deep scan")
+    return picked or None
+
 def branch_name(issue: str, focus: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", (focus or "all").lower()).strip("-")[:20] or "all"
     return f"improve/repo-{issue or 'dispatch'}-{slug}"
@@ -103,7 +169,7 @@ def _call_once(model: str, prompt: str, key: str, timeout: float) -> str:
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read())["candidates"][0]["content"]["parts"][0]["text"]
 
-def call_gemini(prompt: str) -> str:
+def call_gemini(prompt: str, first_model: str | None = None) -> str:
     """Gemini call with per-model retries, then fallback to the next model
     in the chain. Non-streaming generateContent returns everything at once,
     so a slow model on a big prompt can exceed a plain socket timeout (run
@@ -119,12 +185,17 @@ def call_gemini(prompt: str) -> str:
     timeout = float(os.environ.get("GEMINI_TIMEOUT", "300"))
     attempts = int(os.environ.get("GEMINI_ATTEMPTS", "5"))
     failures = []
-    for model in model_chain():
+    chain = model_chain()
+    if first_model and first_model in chain:
+        chain = [first_model] + [m for m in chain if m != first_model]
+    elif first_model:
+        chain = [first_model] + chain
+    for model in chain:
         last = None
         for attempt in range(attempts):
             try:
                 text = _call_once(model, prompt, key, timeout)
-                if model != model_chain()[0]:
+                if model != chain[0]:
                     print(f"  Gemini answered via fallback model {model}", flush=True)
                 LAST_MODEL_USED = model
                 return text
@@ -178,9 +249,19 @@ def main() -> int:
         return 0
     if not files:
         print("Nothing scannable — no PR."); return 0
-    chunks, batch, size = [], [], 0
+    contents = {}
     for rel in files:
-        with open(os.path.join(root, rel), errors="ignore") as fh: content = fh.read()
+        with open(os.path.join(root, rel), errors="ignore") as fh: contents[rel] = fh.read()
+    # Token cut: skeleton triage first (whole-repo runs only; a path focus
+    # is already scoped, and small repos gain nothing from a triage call).
+    path_focus = bool(focus and os.path.isdir(os.path.join(root, focus)))
+    deep_files = files
+    if len(files) > 12 and not path_focus:
+        picked = triage_pick(files, contents, focus)
+        if picked: deep_files = picked
+    chunks, batch, size = [], [], 0
+    for rel in deep_files:
+        content = contents[rel]
         if size + len(content) > 30_000 and batch: chunks.append(batch); batch, size = [], 0
         batch.append((rel, content)); size += len(content)
     if batch: chunks.append(batch)
@@ -189,7 +270,14 @@ def main() -> int:
     for i, batch in enumerate(chunks, 1):
         prompt = ("You are improving an ENTIRE repository, not a PR diff. "
                   f"Focus: {focus or 'all categories (bug risk, security, performance, dead code, readability)'}.\n"
-                  "Return ONLY concrete improvements as blocks:\nFILE: relative/path\n```\n<full new file content>\n```\n"
+                  "Work like a lazy senior dev: does the change need to exist at all? Reuse what the "
+                  "codebase, standard library, or platform already provides before adding code; no new "
+                  "dependencies, no new abstractions, deletion over addition. Never simplify away input "
+                  "validation, error handling, security, or accessibility.\n"
+                  "Return ONLY concrete improvements as PATCH blocks (exact text, copied verbatim):\n"
+                  "PATCH: relative/path\n<<<<<<< SEARCH\n<exact original lines>\n=======\n<replacement lines>\n>>>>>>> REPLACE\n"
+                  "One PATCH block per edit; a file may have several. Only for a brand-new file, or a "
+                  "rewrite so large a patch would be longer, use:\nFILE: relative/path\n```\n<full new file content>\n```\n"
                   "Skip files that need no change. No behaviour changes beyond the improvement.\n\n")
         for rel, content in batch:
             prompt += f"\n===== {rel} =====\n{content}\n"
@@ -198,8 +286,16 @@ def main() -> int:
         except GeminiError as e:
             print(f"  batch {i}/{len(chunks)} failed: {e}")
             failures.append(str(e)); continue
+        for path, pairs in parse_patch_blocks(reply):
+            base = changed.get(path, contents.get(path))
+            if base is None: continue
+            applied = apply_patch(base, pairs)
+            if applied is None:
+                print(f"  patch for {path} did not apply cleanly — skipped")
+                continue
+            if applied != base: changed[path] = applied
         for path, content in parse_file_blocks(reply):
-            changed[path] = content
+            if path not in changed: changed[path] = content
         if len(changed) >= MAX_CHANGED_FILES: break
     if failures and not changed:
         msg = (f"Repo-wide `/improve` run failed: the model call did not complete "
