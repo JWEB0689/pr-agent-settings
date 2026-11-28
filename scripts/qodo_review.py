@@ -89,8 +89,11 @@ def call_gemini(api_key, model, prompt):
         "generationConfig": {
             "temperature": 0.15,
             "responseMimeType": "application/json",
+            "maxOutputTokens": int(os.environ.get("GEMINI_MAX_OUTPUT", "4096")),
         },
     }
+    if os.environ.get("GEMINI_SERVICE_TIER"):
+        payload["serviceTier"] = os.environ["GEMINI_SERVICE_TIER"]
     body_bytes = json.dumps(payload).encode("utf-8")
     for candidate in candidates:
         url = (
