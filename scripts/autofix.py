@@ -135,8 +135,11 @@ def call_gemini(api_key, model, prompt):
     candidates = [primary] + [m for m in FALLBACK_MODELS if m != primary]
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.1, "responseMimeType": "application/json"},
+        "generationConfig": {"temperature": 0.1, "responseMimeType": "application/json",
+                             "maxOutputTokens": int(os.environ.get("GEMINI_MAX_OUTPUT", "8192"))},
     }
+    if os.environ.get("GEMINI_SERVICE_TIER"):
+        payload["serviceTier"] = os.environ["GEMINI_SERVICE_TIER"]
     body_bytes = json.dumps(payload).encode("utf-8")
 
     for candidate in candidates:
