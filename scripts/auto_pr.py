@@ -293,6 +293,24 @@ def compress_log(text: str) -> str:
     flush()
     return "\n".join(out)
 
+def push_branch(branch, cwd=None):
+    """Push a bot-owned branch. Branch names are deterministic
+    (autofix/issue-<N>-..., autofix/run-...), so a stale branch from an
+    earlier attempt makes a plain push non-fast-forward and kills the
+    run. Retry once with --force-with-lease pinned to the remote sha
+    just observed — a human push racing us still blocks the overwrite."""
+    kw = {"cwd": cwd} if cwd else {}
+    try:
+        subprocess.run(["git", "push", "origin", branch], check=True, **kw); return
+    except subprocess.CalledProcessError:
+        out = subprocess.run(["git", "ls-remote", "origin", branch],
+                             capture_output=True, text=True, **kw)
+        sha = out.stdout.split()[0] if out.stdout.strip() else ""
+        if not sha: raise
+        print(f"  remote branch {branch} already exists (stale attempt) — force-with-lease push")
+        subprocess.run(["git", "push", f"--force-with-lease={branch}:{sha}", "origin", branch],
+                       check=True, **kw)
+
 def main() -> int:
     mode = os.environ.get("MODE", "")
     repo = os.environ.get("REPO", "")
@@ -403,7 +421,7 @@ def main() -> int:
         subprocess.run(["git", "add", "-A"], check=True)
         subprocess.run(["git", "-c", "user.email=autofix@muse.ai", "-c", "user.name=Auto-PR Creator",
                         "commit", "-m", f"autofix: {branch}"], check=True)
-        subprocess.run(["git", "push", "origin", branch], check=True)
+        push_branch(branch)
         kind = f"Fixes #{os.environ.get('ISSUE_NUMBER')}" if mode == "issue" else f"Fixes failed run {os.environ.get('RUN_URL','')}"
         skipped_note = ""
         if wf_skipped:
