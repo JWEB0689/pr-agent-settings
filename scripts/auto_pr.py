@@ -82,7 +82,10 @@ def call_gemini(prompt: str) -> str:
         return ""
     timeout = float(os.environ.get("GEMINI_TIMEOUT", "300"))
     attempts = int(os.environ.get("GEMINI_ATTEMPTS", "5"))
-    body = {"contents": [{"parts": [{"text": prompt}]}]}
+    body = {"contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"maxOutputTokens": int(os.environ.get("GEMINI_MAX_OUTPUT", "8192"))}}
+    if os.environ.get("GEMINI_SERVICE_TIER"):
+        body["serviceTier"] = os.environ["GEMINI_SERVICE_TIER"]
     failures = []
     for model in model_chain():
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
@@ -203,6 +206,27 @@ def apply_patch(content: str, pairs):
         content = content.replace(old, new)
     return content
 
+_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_TS_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z\s+")
+
+def compress_log(text: str) -> str:
+    """RTK-style log compression before logs are sent to the model: strip
+    ANSI codes and per-line timestamps, collapse consecutive duplicate lines
+    (xN), drop blank runs. Failure logs are mostly repetition — this cuts
+    input tokens hard without losing the error signal."""
+    out, prev, run = [], None, 0
+    def flush():
+        if run > 1: out.append(f"  ... (previous line repeated x{run})")
+    for raw in text.splitlines():
+        line = _TS_PREFIX.sub("", _ANSI.sub("", raw)).rstrip()
+        if not line:
+            continue
+        if line == prev:
+            run += 1; continue
+        flush(); out.append(line); prev, run = line, 1
+    flush()
+    return "\n".join(out)
+
 def main() -> int:
     mode = os.environ.get("MODE", "")
     repo = os.environ.get("REPO", "")
@@ -220,7 +244,7 @@ def main() -> int:
         if is_infra_failure(logs):
             print("Infra failure — skipping, no PR."); return 0
         source = (f"Workflow '{os.environ.get('WORKFLOW_NAME')}' failed. "
-                  f"Run: {os.environ.get('RUN_URL','')}\n\nLogs (tail):\n{logs[-12000:]}")
+                  f"Run: {os.environ.get('RUN_URL','')}\n\nLogs (tail, compressed):\n{compress_log(logs)[-12000:]}")
 
     if open_pr_exists(repo, branch):
         print(f"Duplicate guard: open PR already exists for {branch}"); return 0
